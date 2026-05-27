@@ -1,0 +1,38 @@
+# Mirrors notebooks/orbit-wars-reinforcement-learning-tutorial.ipynb default_cfg.yaml
+# (adapted for current rl_training: planet slots, ship buckets, GAE, fast env).
+seed: 42
+run_name: tutorial_ppo_100
+device: cpu
+save_dir: artifacts/rl_current_heuristic_fast
+checkpoint_every: 50
+log_every: 5
+opponent: self
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true
+
+env:
+  episode_steps: 200
+  candidate_count: 49
+  ship_bucket_count: 5
+  use_fast_env: true
+  kaggle_env_root: ../analysis/fast_kaggle_env
+  use_heuristic_planner: false
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 64
+  num_envs: 2
+  total_updates: 100
+  epochs: 4
+  minibatch_size: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 0.0003
+  lr_end: 0.00003
+  max_grad_norm: 0.5

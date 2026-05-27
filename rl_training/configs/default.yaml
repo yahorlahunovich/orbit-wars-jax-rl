@@ -1,0 +1,37 @@
+
+seed: 42
+run_name: orbit_wars_ppo_current_heuristic_fast
+# Use CPU for the short local smoke run; change to auto/cuda for longer training.
+device: cpu
+save_dir: artifacts/rl_current_heuristic_fast
+checkpoint_every: 5
+log_every: 1
+opponent: heuristic
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true
+
+env:
+  episode_steps: 120
+  candidate_count: 49
+  ship_bucket_count: 5
+  use_fast_env: true
+  kaggle_env_root: ../analysis/fast_kaggle_env
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 8
+  num_envs: 2
+  total_updates: 2 # Local smoke setting for the optimized env. Increase for real training.
+  epochs: 1
+  minibatch_size: 128
+  gamma: 0.99
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 0.0003
+  max_grad_norm: 0.5
+
+

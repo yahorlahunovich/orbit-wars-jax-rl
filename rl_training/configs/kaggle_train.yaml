@@ -1,0 +1,36 @@
+seed: 321
+run_name: reinforce_bucket_ppo_v2_kaggle
+device: cuda
+save_dir: artifacts
+checkpoint_every: 50
+log_every: 10
+opponent: heuristic
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true
+
+env:
+  episode_steps: 200
+  candidate_count: 49
+  ship_bucket_count: 5
+  use_fast_env: false
+  kaggle_env_root: ""
+  use_heuristic_planner: true
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 16
+  num_envs: 4
+  total_updates: 2000
+  epochs: 3
+  minibatch_size: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 0.0003
+  lr_end: 0.00003
+  max_grad_norm: 0.5

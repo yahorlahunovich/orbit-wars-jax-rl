@@ -1,0 +1,46 @@
+---
+description: Orbit Wars RL project rules
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# Orbit Wars Cursor Rules
+
+RL-first project. Active code: `rl_training/`. Heuristic bots: `versions/` only.
+
+## Source of truth
+
+- Training: `rl_training/src/`
+- Configs: `rl_training/configs/`
+- Heuristic opponent: `versions/kaggle700_current_heuristic/`
+- Fast env: `analysis/fast_kaggle_env/`
+
+## Interface (RL policy)
+
+- Decision rows per owned planet: target slot + ship bucket
+- Returns decoded as `[[from_planet_id, angle_radians, num_ships], ...]`
+- Keep training deterministic unless documented
+
+## Work pattern
+
+1. Read `docs/RL_TRAINING_NOTES.md`
+2. Change `rl_training/src/` or configs
+3. Smoke: `python -m src.train --config configs/smoke_ppo.yaml --no-bc-init`
+4. Eval vs heuristic: `scripts/eval_policy.py --baseline heuristic`
+
+## Commands
+
+```bash
+cd rl_training
+conda run -n ml python -m src.train --config configs/smoke_ppo.yaml --no-bc-init
+```
+
+```bash
+conda run -n ml python scripts/bench_direct.py \
+  --agent-a versions/kaggle700_current_heuristic/main.py \
+  --agent-b noop --games 3 --episode-steps 200 \
+  --kaggle-env-root analysis/fast_kaggle_env
+```
+
+GPU-heavy BC/PPO: tell user explicitly and give Kaggle `--device cuda` commands.

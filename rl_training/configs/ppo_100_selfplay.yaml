@@ -1,0 +1,35 @@
+seed: 321
+run_name: ppo_100_terminal_selfplay
+device: cpu
+save_dir: artifacts/rl_current_heuristic_fast
+checkpoint_every: 50
+log_every: 10
+opponent: self
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true
+
+env:
+  episode_steps: 200
+  candidate_count: 49
+  ship_bucket_count: 5
+  use_fast_env: true
+  kaggle_env_root: ../analysis/fast_kaggle_env
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 16
+  num_envs: 4
+  total_updates: 100
+  epochs: 3
+  minibatch_size: 128
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 0.001
+  lr_end: 0.0001
+  max_grad_norm: 0.5
