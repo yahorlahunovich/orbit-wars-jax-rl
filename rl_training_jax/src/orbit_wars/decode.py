@@ -158,6 +158,7 @@ def compose_action_grid(
     *,
     intercept_iterations: int = INTERCEPT_ITERATIONS,
     enable_planet_block: bool = True,
+    enable_incoming_projection: bool = True,
 ) -> dict[str, jnp.ndarray]:
     """Pre-compute everything the policy/rollout needs about every
     (source, target, bucket) triple in a single state.
@@ -192,8 +193,12 @@ def compose_action_grid(
 
     tgt_orbiting = is_orbiting_planet(x, y, radius)  # (P,)
 
-    from .features_jax import _fleet_projections
-    incoming_me, incoming_enemy, _, _ = _fleet_projections(state, player_f)
+    if enable_incoming_projection:
+        from .features_jax import _fleet_projections
+        incoming_me, incoming_enemy, _, _ = _fleet_projections(state, player_f)
+    else:
+        incoming_me = jnp.zeros_like(ships)
+        incoming_enemy = jnp.zeros_like(ships)
 
     src_ships_grid = ships[:, None]                  # (P, 1)
     tgt_ships_grid = ships[None, :]                  # (1, P)

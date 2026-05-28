@@ -64,6 +64,17 @@ def main() -> None:
         default=None,
         help="Override action-grid intercept iterations.",
     )
+    incoming_proj = parser.add_mutually_exclusive_group()
+    incoming_proj.add_argument(
+        "--enable-incoming-projection",
+        action="store_true",
+        help="Enable incoming fleet projections in action grid.",
+    )
+    incoming_proj.add_argument(
+        "--disable-incoming-projection",
+        action="store_true",
+        help="Disable incoming fleet projections (faster).",
+    )
     planet_block = parser.add_mutually_exclusive_group()
     planet_block.add_argument("--enable-planet-block", action="store_true", help="Enable planet block checks.")
     planet_block.add_argument("--disable-planet-block", action="store_true", help="Disable planet block checks.")
@@ -84,6 +95,10 @@ def main() -> None:
         cfg.enable_planet_block = True
     if args.disable_planet_block:
         cfg.enable_planet_block = False
+    if args.enable_incoming_projection:
+        cfg.enable_incoming_projection = True
+    if args.disable_incoming_projection:
+        cfg.enable_incoming_projection = False
     opponent_mode = _resolve_opponent(cfg, args.opponent)
 
     model, params = _build_model(cfg)
@@ -91,6 +106,7 @@ def main() -> None:
         compose_action_grid,
         intercept_iterations=cfg.intercept_iterations,
         enable_planet_block=cfg.enable_planet_block,
+        enable_incoming_projection=cfg.enable_incoming_projection,
     )
     rollout_selfplay = rollout_step_selfplay_factory(model, grid_fn)
     rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model, grid_fn)
@@ -146,7 +162,8 @@ def main() -> None:
         "bench_sps | "
         f"envs={cfg.num_envs} rollout={cfg.rollout_steps} updates={args.updates} "
         f"opponent={opponent_mode} intercept_iters={cfg.intercept_iterations} "
-        f"planet_block={cfg.enable_planet_block} no_reset={args.no_reset} "
+        f"planet_block={cfg.enable_planet_block} incoming_proj={cfg.enable_incoming_projection} "
+        f"no_reset={args.no_reset} "
         f"no_comets={args.no_comets} env_sps={env_sps:.1f} elapsed={elapsed:.2f}s",
         flush=True,
     )

@@ -76,6 +76,7 @@ class TrainConfig:
     rollout_steps: int = 32
     intercept_iterations: int = INTERCEPT_ITERATIONS
     enable_planet_block: bool = True
+    enable_incoming_projection: bool = True
 
     # Model
     d_model: int = 96
@@ -126,6 +127,7 @@ def load_config(path: str | Path) -> TrainConfig:
         rollout_steps=int(env.get("rollout_steps", 32)),
         intercept_iterations=int(env.get("intercept_iterations", INTERCEPT_ITERATIONS)),
         enable_planet_block=bool(env.get("enable_planet_block", True)),
+        enable_incoming_projection=bool(env.get("enable_incoming_projection", True)),
         d_model=int(model.get("d_model", 96)),
         num_heads=int(model.get("num_heads", 4)),
         num_layers=int(model.get("num_layers", 3)),
@@ -467,6 +469,7 @@ def train(cfg: TrainConfig) -> None:
         compose_action_grid,
         intercept_iterations=cfg.intercept_iterations,
         enable_planet_block=cfg.enable_planet_block,
+        enable_incoming_projection=cfg.enable_incoming_projection,
     )
     rollout_selfplay = rollout_step_selfplay_factory(model, grid_fn)
     rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model, grid_fn)

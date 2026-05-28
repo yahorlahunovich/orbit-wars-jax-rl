@@ -11,6 +11,7 @@ env:
   rollout_steps: 32
   intercept_iterations: 6    # reduce intercept iterations for faster grid build
   enable_planet_block: false # skip planet-block checks for speed
+  enable_incoming_projection: false # skip incoming fleet projections for speed
 
 model:
   d_model: 96
