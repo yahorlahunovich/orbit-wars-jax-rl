@@ -28,9 +28,26 @@ def default_heuristic_path() -> Path:
     )
 
 
+def _resolve_custom_path(path: Path) -> Path:
+    """Resolve a user-supplied path relative to cwd or repo root."""
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path.resolve()
+    here = Path(__file__).resolve()
+    for root in here.parents:
+        candidate = root / path
+        if candidate.exists():
+            return candidate
+    return path
+
+
 def load_heuristic_agent(path: Path | None = None) -> Callable[[Any], list]:
     """Import and return the heuristic `agent(obs)` function."""
-    bot_path = (path or default_heuristic_path()).resolve()
+    if path is None:
+        bot_path = default_heuristic_path().resolve()
+    else:
+        bot_path = _resolve_custom_path(Path(path)).resolve()
     heur_root = bot_path.parent
     if str(heur_root) not in sys.path:
         sys.path.insert(0, str(heur_root))
