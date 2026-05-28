@@ -55,11 +55,35 @@ def main() -> None:
     parser.add_argument("--updates", type=int, default=50, help="Number of rollout batches to time.")
     parser.add_argument("--warmup", type=int, default=2, help="Warmup batches (not timed).")
     parser.add_argument("--opponent", choices=["selfplay", "heuristic"], default=None)
+    parser.add_argument("--num-envs", type=int, default=None, help="Override env.num_envs for quick tests.")
+    parser.add_argument("--rollout-steps", type=int, default=None, help="Override env.rollout_steps.")
+    parser.add_argument("--episode-steps", type=int, default=None, help="Override env.episode_steps.")
+    parser.add_argument(
+        "--intercept-iterations",
+        type=int,
+        default=None,
+        help="Override action-grid intercept iterations.",
+    )
+    planet_block = parser.add_mutually_exclusive_group()
+    planet_block.add_argument("--enable-planet-block", action="store_true", help="Enable planet block checks.")
+    planet_block.add_argument("--disable-planet-block", action="store_true", help="Disable planet block checks.")
     parser.add_argument("--no-reset", action="store_true", help="Skip done detection + resets.")
     parser.add_argument("--no-comets", action="store_true", help="Skip host comet spawn checks.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.num_envs is not None:
+        cfg.num_envs = int(args.num_envs)
+    if args.rollout_steps is not None:
+        cfg.rollout_steps = int(args.rollout_steps)
+    if args.episode_steps is not None:
+        cfg.episode_steps = int(args.episode_steps)
+    if args.intercept_iterations is not None:
+        cfg.intercept_iterations = int(args.intercept_iterations)
+    if args.enable_planet_block:
+        cfg.enable_planet_block = True
+    if args.disable_planet_block:
+        cfg.enable_planet_block = False
     opponent_mode = _resolve_opponent(cfg, args.opponent)
 
     model, params = _build_model(cfg)
