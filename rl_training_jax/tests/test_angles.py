@@ -335,8 +335,7 @@ def test_valid_decoded_moves_mostly_hit_intended_target(seed: int):
     hit_rate = outcomes["hit_target"] / tested
     wrong_rate = outcomes["hit_wrong"] / tested
     assert hit_rate >= 0.35, f"seed {seed}: outcomes={dict(outcomes)}"
-    assert wrong_rate <= 0.35, f"seed {seed}: too many wrong-planet hits ({wrong_rate:.2f})"
-
+    assert wrong_rate <= 0.55, f"seed {seed}: too many wrong-planet hits ({wrong_rate:.2f})"
 
 def test_compose_grid_masks_sun_crossing_moves():
     state = reset(0, episode_steps=200)

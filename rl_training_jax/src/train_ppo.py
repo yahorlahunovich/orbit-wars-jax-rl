@@ -268,9 +268,7 @@ def learner_record_from_samples(
     return {
         "planet_features": learner_feats["planet_features"],
         "planet_mask": learner_feats["planet_mask"],
-        "fleet_features": learner_feats["fleet_features"],
-        "fleet_mask": learner_feats["fleet_mask"],
-        "global_features": learner_feats["global_features"],
+
         "target_idx": target_idx,
         "bucket_idx": bucket_idx,
         "log_prob": log_prob,
@@ -371,9 +369,6 @@ def init_policy_params(rng, model: PlanetPolicy):
     example = {
         "planet_features": jnp.zeros((1, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((1, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.ones((1, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((1, GLOBAL_FEATURE_DIM), jnp.float32),
     }
     return model.init(rng, **example), example
 
@@ -560,8 +555,7 @@ def train(cfg: TrainConfig) -> None:
         v_sub = model.apply(
             params,
             planet_features=sub["planet_features"], planet_mask=sub["planet_mask"],
-            fleet_features=sub["fleet_features"], fleet_mask=sub["fleet_mask"],
-            global_features=sub["global_features"],
+
         ).value
         ev = float(explained_variance(sub["returns"], v_sub))
 

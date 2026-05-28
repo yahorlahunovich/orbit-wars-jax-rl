@@ -62,14 +62,11 @@ def _load_policy(checkpoint: Path, config: Path):
         num_layers=cfg.num_layers,
         bucket_count=cfg.bucket_count,
     )
-    from orbit_wars import FLEET_FEATURE_DIM, GLOBAL_FEATURE_DIM, PLANET_FEATURE_DIM
+    from orbit_wars import PLANET_FEATURE_DIM
 
     example = {
         "planet_features": jnp.zeros((1, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((1, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.ones((1, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((1, GLOBAL_FEATURE_DIM), jnp.float32),
     }
     init_params = model.init(jax.random.PRNGKey(0), **example)
     blob = bytes(np.load(checkpoint, allow_pickle=False)["params"].tobytes())

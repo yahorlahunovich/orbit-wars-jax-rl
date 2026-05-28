@@ -1,231 +1,21 @@
-"""Pure-JAX feature encoder for Orbit Wars.
+import re
 
-This module converts an `OrbitWarsState` (or a batched `vmap` thereof) into
-fixed-shape entity-level features:
+with open('rl_training_jax/src/orbit_wars/features_jax.py', 'r') as f:
+    content = f.read()
 
-- planet features:  (B, MAX_PLANETS, F_PLANET)        plus planet_mask  (B, MAX_PLANETS)
-- fleet  features:  (B, MAX_FLEETS,  F_FLEET)         plus fleet_mask   (B, MAX_FLEETS)
-- global features:  (B, F_GLOBAL)
-
-All features are player-relative (perspective of `player`) — owner flags, lead
-ratios, etc. are flipped automatically for the opposite side.
-
-The encoder is JIT-friendly and vmappable. No NumPy bridge.
-"""
-
-from __future__ import annotations
-
-import jax
-import jax.numpy as jnp
-
-from .constants import (
-    BOARD_SIZE,
-    CENTER,
-    COMET_SPAWN_STEPS,
-    DEFAULT_SHIP_SPEED,
-    MAX_COMET_GROUPS,
-    MAX_FLEETS,
-    MAX_PLANETS,
-    ROTATION_RADIUS_LIMIT,
-    SUN_RADIUS,
-)
-from .geometry import fleet_speed
-from .state import OrbitWarsState
-
-PLANET_FEATURE_DIM = 55
-FLEET_FEATURE_DIM = 15
-GLOBAL_FEATURE_DIM = 22
-
-# Normalization constants.
-SHIPS_LOG_DENOM = jnp.log1p(jnp.float32(5000.0))
-FLEET_SHIPS_LOG_DENOM = jnp.log1p(jnp.float32(500.0))
-PRODUCTION_DENOM = jnp.float32(5.0)
-RADIUS_DENOM = jnp.float32(10.0)
-DIST_DENOM = jnp.float32(50.0)
-INCOMING_PERP_TOL = jnp.float32(3.0)  # how close a fleet's path must come to a planet to count as "incoming"
-
-
-def _ships_log_norm(ships: jnp.ndarray) -> jnp.ndarray:
-    """log1p(ships) / log1p(5000)."""
-    return jnp.log1p(jnp.maximum(ships, 0.0)) / SHIPS_LOG_DENOM
-
-
-def _fleet_ships_log_norm(ships: jnp.ndarray) -> jnp.ndarray:
-    return jnp.log1p(jnp.maximum(ships, 0.0)) / FLEET_SHIPS_LOG_DENOM
-
-
-def _is_comet_per_planet(state: OrbitWarsState) -> jnp.ndarray:
-    """Boolean per-planet flag, vectorized."""
-    pids = state.planets[:, 0].astype(jnp.int32)
-    cpids = state.comet_planet_ids
-    valid = cpids >= 0
-    return jnp.any((pids[:, None] == cpids[None, :]) & valid[None, :], axis=-1)
-
-
-def _is_orbiting_per_planet(state: OrbitWarsState) -> jnp.ndarray:
-    init = state.initial_planets
-    dx = init[:, 2] - CENTER
-    dy = init[:, 3] - CENTER
-    orbit_r = jnp.sqrt(dx * dx + dy * dy)
-    radius = state.planets[:, 4]
-    return orbit_r + radius < ROTATION_RADIUS_LIMIT
-
-
-def _fleet_projections(state: OrbitWarsState, player_f: jnp.float32) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Calculate exact destination and ETA for all fleets using physics."""
-    planets = state.planets
-    fleets = state.fleets
-    
-    fx = fleets[:, 2]
-    fy = fleets[:, 3]
-    angle = fleets[:, 4]
-    cos_a = jnp.cos(angle)
-    sin_a = jnp.sin(angle)
-    fleet_ships = fleets[:, 6]
-    speed = fleet_speed(fleet_ships, state.ship_speed)
-    fleet_active = fleets[:, 7] > 0.0
-
-    px = planets[:, 2]
-    py = planets[:, 3]
-    radius = planets[:, 4]
-    planet_active = planets[:, 7] > 0.0
-
-    dx = px[None, :] - fx[:, None]     # (F, P)
-    dy = py[None, :] - fy[:, None]     # (F, P)
-    
-    ux = cos_a[:, None]
-    uy = sin_a[:, None]
-    
-    dot_ru = dx * ux + dy * uy
-    
-    sp = speed[:, None]
-    sp_safe = jnp.maximum(sp, 1e-6)
-    t_close_raw = dot_ru / sp_safe
-    t_close = jnp.where(dot_ru > 0.0, t_close_raw, 0.0)
-    
-    cx = fx[:, None] + sp * ux * t_close
-    cy = fy[:, None] + sp * uy * t_close
-    
-    d_close = jnp.sqrt((px[None, :] - cx)**2 + (py[None, :] - cy)**2)
-    
-    slop = jnp.float32(3.0)
-    collides = (t_close > 0.0) & (d_close <= radius[None, :] + slop) & planet_active[None, :]
-    
-    big = jnp.float32(1e9)
-    masked_t_close = jnp.where(collides, t_close, big)
-    
-    best_t_close = jnp.min(masked_t_close, axis=1) # (F,)
-    best_p_idx = jnp.argmin(masked_t_close, axis=1) # (F,)
-    
-    has_target = fleet_active & (best_t_close < big)
-    
-    fleet_owner = fleets[:, 1]
-    f_is_me = has_target & (fleet_owner == player_f)
-    f_is_enemy = has_target & (fleet_owner >= 0.0) & (fleet_owner != player_f)
-    
-    incoming_me = jnp.zeros(MAX_PLANETS, dtype=jnp.float32)
-    incoming_me = incoming_me.at[best_p_idx].add(jnp.where(f_is_me, fleet_ships, 0.0))
-    
-    incoming_enemy = jnp.zeros(MAX_PLANETS, dtype=jnp.float32)
-    incoming_enemy = incoming_enemy.at[best_p_idx].add(jnp.where(f_is_enemy, fleet_ships, 0.0))
-    
-    eta_me = jnp.full(MAX_PLANETS, big, dtype=jnp.float32)
-    eta_me = eta_me.at[best_p_idx].min(jnp.where(f_is_me, best_t_close, big))
-    
-    eta_enemy = jnp.full(MAX_PLANETS, big, dtype=jnp.float32)
-    eta_enemy = eta_enemy.at[best_p_idx].min(jnp.where(f_is_enemy, best_t_close, big))
-    
-    eta_me_norm = jnp.minimum(eta_me, 100.0) / 100.0
-    eta_enemy_norm = jnp.minimum(eta_enemy, 100.0) / 100.0
-    
-    return incoming_me, incoming_enemy, eta_me_norm, eta_enemy_norm
-
-
-def _nearest_distance_to_subset(
-    planets: jnp.ndarray,
-    subset_mask: jnp.ndarray,
-) -> jnp.ndarray:
-    """For each planet, distance to the nearest other planet in `subset_mask`.
-
-    Returns DIST_DENOM if the subset is empty.
-    """
-    x = planets[:, 2]
-    y = planets[:, 3]
-    dx = x[:, None] - x[None, :]
-    dy = y[:, None] - y[None, :]
-    dist = jnp.sqrt(dx * dx + dy * dy)
-    big = jnp.float32(1e6)
-    # Exclude self and rows outside the subset.
-    self_mask = jnp.eye(MAX_PLANETS, dtype=jnp.bool_)
-    masked = jnp.where(subset_mask[None, :] & (~self_mask), dist, big)
-    nearest = jnp.min(masked, axis=-1)
-    # Convert "no subset member" sentinel (big) to a finite max distance.
-    nearest = jnp.where(nearest >= big, DIST_DENOM * 3.0, nearest)
-    return nearest
-
-
-def _rank_norm(values: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    """For each entry, fraction of *masked* entries with a strictly smaller value.
-
-    For inactive entries (`~mask`) returns 0. Output in `[0, 1]`. 1.0 means
-    "largest in the masked set"; 0.0 means "smallest in the masked set".
-    """
-    eligible_count = jnp.sum(mask.astype(jnp.float32))
-    smaller = jnp.sum(
-        (values[:, None] > values[None, :])
-        & mask[None, :]
-        & mask[:, None],
-        axis=-1,
-    ).astype(jnp.float32)
-    denom = jnp.maximum(eligible_count - 1.0, 1.0)
-    return jnp.where(mask, smaller / denom, 0.0)
-
-
-def _comet_remaining_life(state: OrbitWarsState) -> jnp.ndarray:
-    """For each planet slot, remaining comet path steps (else 0).
-
-    Vectorized: for each (g, q) comet quad, scatter remaining = path_length -
-    (path_index + 1) into the planet slot whose id matches.
-    """
-    comets = state.comets
-    cgpids = comets.planet_ids
-    cplens = comets.path_lengths
-    cactive = comets.active
-    idx_next = comets.path_index + 1
-
-    pids = state.planets[:, 0].astype(jnp.int32)
-    active = state.planets[:, 7] > 0.0
-
-    match_gqp = (
-        (cgpids[..., None] == pids[None, None, :])
-        & active[None, None, :]
-        & (cgpids[..., None] >= 0)
-    )                                                # (G, 4, P)
-    slot_gq = jnp.argmax(match_gqp.astype(jnp.int32), axis=-1)
-    has_match_gq = jnp.any(match_gqp, axis=-1)
-    remaining_gq = (cplens - idx_next[:, None]).astype(jnp.float32)
-    remaining_gq = jnp.maximum(remaining_gq, 0.0)
-    valid_gq = has_match_gq & cactive[:, None] & (cgpids >= 0)
-
-    out = jnp.zeros((MAX_PLANETS,), dtype=jnp.float32)
-    flat_slot = slot_gq.reshape(-1)
-    flat_val = jnp.where(valid_gq.reshape(-1), remaining_gq.reshape(-1), 0.0)
-    out = out.at[flat_slot].set(jnp.maximum(out[flat_slot], flat_val))
-    return out
-
-
-def encode_observation(
+# Define the new encode_observation function
+new_encode = """def encode_observation(
     state: OrbitWarsState,
     player: jnp.int32 | int,
 ) -> dict[str, jnp.ndarray]:
-    """Encode a single (unbatched) state into entity features for `player`.
+    \"\"\"Encode a single (unbatched) state into entity features for `player`.
 
     Returns a dict with keys:
         planet_features (P, F_PLANET) float32
         planet_mask     (P,)           bool
 
     Apply `jax.vmap(encode_observation, in_axes=(0, None))` for batched envs.
-    """
+    \"\"\"
     player_f = jnp.float32(player)
     planets = state.planets
     fleets = state.fleets
@@ -399,16 +189,13 @@ def encode_observation(
     return {
         "planet_features": planet_features,
         "planet_mask": planet_mask,
-    }
+    }"""
 
-
-# Pre-jitted single + batched variants for convenience.
-encode_observation_jit = jax.jit(encode_observation, static_argnames=())
-
-
-def encode_batch(states: OrbitWarsState, players: jnp.ndarray) -> dict[str, jnp.ndarray]:
-    """Vmapped encoder. `players` has shape (B,) int32."""
-    return jax.vmap(encode_observation, in_axes=(0, 0))(states, players)
-
-
-encode_batch_jit = jax.jit(encode_batch)
+match = re.search(r"def encode_observation\(.*?-> dict\[str, jnp\.ndarray\]:.*?    return \{.*?    \}", content, re.DOTALL)
+if match:
+    content = content[:match.start()] + new_encode + content[match.end():]
+    with open('rl_training_jax/src/orbit_wars/features_jax.py', 'w') as f:
+        f.write(content)
+    print("Success")
+else:
+    print("Match failed")

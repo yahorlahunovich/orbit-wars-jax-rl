@@ -197,7 +197,6 @@ def merge_batches(batches) -> tuple[dict[str, jnp.ndarray] | None, int]:
     return {
         "self_features": jnp.asarray(np.concatenate([b.self_features for b in batches], axis=0)),
         "candidate_features": jnp.asarray(np.concatenate([b.candidate_features for b in batches], axis=0)),
-        "global_features": jnp.asarray(np.concatenate([b.global_features for b in batches], axis=0)),
         "candidate_mask": jnp.asarray(np.concatenate([b.candidate_mask for b in batches], axis=0)),
         "ship_bucket_mask": jnp.asarray(np.concatenate([b.ship_bucket_mask for b in batches], axis=0)),
         "bucket_features": jnp.asarray(np.concatenate([b.bucket_features for b in batches], axis=0)),
@@ -319,7 +318,6 @@ def collect_rollout(rng, model, params, envs, batches, cfg, next_seed):
     transition = {
         "self_features": jnp.asarray(np.asarray(self_rows, np.float32)),
         "candidate_features": jnp.asarray(np.asarray(cand_rows, np.float32)),
-        "global_features": jnp.asarray(np.asarray(glob_rows, np.float32)),
         "candidate_mask": jnp.asarray(np.asarray(cmasks, bool)),
         "ship_bucket_mask": jnp.asarray(np.asarray(smasks, bool)),
         "bucket_features": jnp.asarray(np.asarray(bfeats, np.float32)),
@@ -369,7 +367,6 @@ def train(cfg: TrainConfig) -> None:
     init_batch = {
         "self_features": jnp.zeros((2, self_dim), jnp.float32),
         "candidate_features": jnp.zeros((2, cfg.candidate_count, cand_dim), jnp.float32),
-        "global_features": jnp.zeros((2, glob_dim), jnp.float32),
         "candidate_mask": jnp.ones((2, cfg.candidate_count), jnp.bool_),
         "ship_bucket_mask": jnp.ones((2, cfg.candidate_count, cfg.ship_bucket_count), jnp.bool_),
         "bucket_features": jnp.zeros((2, cfg.candidate_count, cfg.ship_bucket_count, bucket_dim), jnp.float32),

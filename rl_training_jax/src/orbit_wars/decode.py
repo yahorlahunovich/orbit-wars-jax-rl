@@ -8,13 +8,13 @@ over batch × source.
 Ship-bucket scheme (BUCKET_COUNT = 8):
 
     0  25%  of source ships    (min 4 ships)
-    1  25%  of source ships
-    2  50%  of source ships
-    3  75%  of source ships
-    4 100%  of source ships    (all-in)
-    5  target_ships + 1        (minimal capture)
-    6  target_ships + 50% src  (capture with reserve)
-    7  4 ships                 (constant minimum)
+    1  50%  of source ships
+    2  75%  of source ships
+    3 100%  of source ships    (all-in)
+    4  target_ships + 1        (minimal capture)
+    5  target_ships + 50% src  (capture with reserve)
+    6  target_ships + inc_enemy - inc_allied + 1 (smart capture minimal)
+    7  target_ships + inc_enemy - inc_allied + 25% src (smart capture reserve)
 
 Buckets are masked invalid when the computed ship count is <= 0 or exceeds the
 source planet's current ship count.
@@ -49,18 +49,13 @@ SUN_PATH_MARGIN = 1.5
 PATH_PLANET_MARGIN = 1.0
 INTERCEPT_ITERATIONS = 25
 
-# Per-bucket coefficients: ship_count = max(MIN, src*src_frac + tgt*tgt_frac + plus)
-_SRC_FRAC = jnp.array([0.25, 0.25, 0.50, 0.75, 1.00, 0.00, 0.50, 0.00], dtype=jnp.float32)
-_TGT_FRAC = jnp.array([0.00, 0.00, 0.00, 0.00, 0.00, 1.00, 1.00, 0.00], dtype=jnp.float32)
-_PLUS = jnp.array([0.00, 0.00, 0.00, 0.00, 0.00, 1.00, 0.00, 4.00], dtype=jnp.float32)
-_MIN = jnp.full((BUCKET_COUNT,), float(MIN_LAUNCH_SHIPS), dtype=jnp.float32)
 
 # Launch offset to avoid spawning fleets inside the source planet.
 LAUNCH_OFFSET_PADDING = 0.1
 
 
 def ship_counts_for_buckets(
-    source_ships: jnp.ndarray, target_ships: jnp.ndarray
+    source_ships: jnp.ndarray, target_ships: jnp.ndarray, incoming_me: jnp.ndarray, incoming_enemy: jnp.ndarray
 ) -> jnp.ndarray:
     """Return integer-valued ship counts for every bucket index.
 
@@ -69,8 +64,22 @@ def ship_counts_for_buckets(
     """
     src = source_ships[..., None]
     tgt = target_ships[..., None]
-    raw = src * _SRC_FRAC + tgt * _TGT_FRAC + _PLUS
-    raw = jnp.maximum(raw, _MIN)
+    inc_me = incoming_me[..., None]
+    inc_en = incoming_enemy[..., None]
+    
+    b0 = src * 0.25
+    b1 = src * 0.50
+    b2 = src * 0.75
+    b3 = src * 1.00
+    b4 = tgt + 1.0
+    b5 = tgt + src * 0.50
+    b6 = jnp.maximum(0.0, tgt + inc_en - inc_me) + 1.0
+    b7 = jnp.maximum(0.0, tgt + inc_en - inc_me) + src * 0.25
+    
+    b0, b1, b2, b3, b4, b5, b6, b7 = jnp.broadcast_arrays(b0, b1, b2, b3, b4, b5, b6, b7)
+    
+    raw = jnp.concatenate([b0, b1, b2, b3, b4, b5, b6, b7], axis=-1)
+    raw = jnp.maximum(raw, jnp.float32(MIN_LAUNCH_SHIPS))
     # Floor to int while keeping floats (the env stores ships as float32 ints).
     return jnp.floor(raw)
 
@@ -180,9 +189,14 @@ def compose_action_grid(
 
     tgt_orbiting = is_orbiting_planet(x, y, radius)  # (P,)
 
+    from .features_jax import _fleet_projections
+    incoming_me, incoming_enemy, _, _ = _fleet_projections(state, player_f)
+
     src_ships_grid = ships[:, None]                  # (P, 1)
     tgt_ships_grid = ships[None, :]                  # (1, P)
-    ship_counts = ship_counts_for_buckets(src_ships_grid, tgt_ships_grid)  # (P, P, B)
+    inc_me_grid = incoming_me[None, :]               # (1, P)
+    inc_en_grid = incoming_enemy[None, :]            # (1, P)
+    ship_counts = ship_counts_for_buckets(src_ships_grid, tgt_ships_grid, inc_me_grid, inc_en_grid)  # (P, P, B)
 
     p_count = planets.shape[0]
     bucket_axis = ship_counts.shape[-1]

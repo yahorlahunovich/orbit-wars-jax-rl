@@ -28,8 +28,8 @@ from orbit_wars.decode import (
 
 def test_ship_counts_monotone_in_source():
     """Larger source ships should not decrease per-bucket ship counts."""
-    sc_small = ship_counts_for_buckets(jnp.float32(50.0), jnp.float32(10.0))
-    sc_big = ship_counts_for_buckets(jnp.float32(500.0), jnp.float32(10.0))
+    sc_small = ship_counts_for_buckets(jnp.float32(50.0), jnp.float32(10.0), jnp.float32(0.0), jnp.float32(0.0))
+    sc_big = ship_counts_for_buckets(jnp.float32(500.0), jnp.float32(10.0), jnp.float32(0.0), jnp.float32(0.0))
     assert np.all(np.asarray(sc_big) >= np.asarray(sc_small))
 
 
@@ -37,7 +37,7 @@ def test_ship_count_floor_and_minimum():
     """All buckets must produce integer-valued ship counts >= MIN_LAUNCH_SHIPS."""
     from orbit_wars.decode import MIN_LAUNCH_SHIPS
 
-    sc = ship_counts_for_buckets(jnp.float32(20.0), jnp.float32(2.0))
+    sc = ship_counts_for_buckets(jnp.float32(20.0), jnp.float32(2.0), jnp.float32(0.0), jnp.float32(0.0))
     arr = np.asarray(sc)
     assert arr.shape == (BUCKET_COUNT,)
     assert np.all(arr >= MIN_LAUNCH_SHIPS)
@@ -45,15 +45,16 @@ def test_ship_count_floor_and_minimum():
 
 
 def test_bucket_validity_respects_source_cap():
-    sc = ship_counts_for_buckets(jnp.float32(5.0), jnp.float32(100.0))
+    sc = ship_counts_for_buckets(jnp.float32(5.0), jnp.float32(100.0), jnp.float32(0.0), jnp.float32(0.0))
     mask = bucket_validity_mask(sc, jnp.float32(5.0))
     arr = np.asarray(mask)
-    # Capture buckets (5, 6) need target_ships+ ships -> 101, 102 -> too many.
+    # Capture buckets (4, 5, 6, 7) need target_ships+ ships -> 101, 102 -> too many.
+    assert not arr[4]
     assert not arr[5]
     assert not arr[6]
+    assert not arr[7]
     # Fractional buckets with source=5 -> min 4 ships -> all valid except capture.
-    assert np.all(arr[[0, 1, 2, 3, 4, 7]])
-
+    assert np.all(arr[[0, 1, 2, 3]])
 
 def test_path_crosses_sun_diagonal():
     # Path crossing through the centre is blocked.

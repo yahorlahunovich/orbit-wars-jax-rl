@@ -34,7 +34,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from orbit_wars import FLEET_FEATURE_DIM, GLOBAL_FEATURE_DIM, MAX_FLEETS, MAX_PLANETS, PLANET_FEATURE_DIM
+from orbit_wars import MAX_FLEETS, MAX_PLANETS, PLANET_FEATURE_DIM
 from policy import PlanetPolicy
 from train_ppo import load_config
 
@@ -115,9 +115,6 @@ def export(checkpoint: Path, config: Path, output: Path) -> None:
     example = {
         "planet_features": jnp.zeros((1, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((1, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.ones((1, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((1, GLOBAL_FEATURE_DIM), jnp.float32),
     }
     init_params = model.init(jax.random.PRNGKey(0), **example)
     params = flax.serialization.from_bytes(init_params, blob)
@@ -132,8 +129,6 @@ def export(checkpoint: Path, config: Path, output: Path) -> None:
             "num_layers": cfg.num_layers,
             "bucket_count": cfg.bucket_count,
             "planet_feature_dim": PLANET_FEATURE_DIM,
-            "fleet_feature_dim": FLEET_FEATURE_DIM,
-            "global_feature_dim": GLOBAL_FEATURE_DIM,
         }, indent=2),
         encoding="utf-8",
     )

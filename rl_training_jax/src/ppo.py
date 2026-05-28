@@ -147,9 +147,6 @@ def ppo_loss_fn(
         params,
         planet_features=batch["planet_features"],
         planet_mask=batch["planet_mask"],
-        fleet_features=batch["fleet_features"],
-        fleet_mask=batch["fleet_mask"],
-        global_features=batch["global_features"],
     )                                                # value (N,), target_logits (N,P,P), bucket_logits (N,P,B)
 
     info = joint_log_prob_and_entropy(

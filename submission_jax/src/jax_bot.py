@@ -64,9 +64,6 @@ def _load() -> None:
     example = {
         "planet_features": jnp.zeros((1, MAX_PLANETS, cfg["planet_feature_dim"]), jnp.float32),
         "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((1, MAX_FLEETS, cfg["fleet_feature_dim"]), jnp.float32),
-        "fleet_mask": jnp.ones((1, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((1, cfg["global_feature_dim"]), jnp.float32),
     }
     init_params = model.init(init_rng, **example)
     params = flax.serialization.from_bytes(init_params, raw)

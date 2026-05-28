@@ -40,12 +40,11 @@ def test_encode_shapes_and_dims():
     out = encode_observation(state, jnp.int32(0))
 
     assert out["planet_features"].shape == (MAX_PLANETS, PLANET_FEATURE_DIM)
-    assert out["fleet_features"].shape == (MAX_FLEETS, FLEET_FEATURE_DIM)
-    assert out["global_features"].shape == (GLOBAL_FEATURE_DIM,)
+    # no fleet_features
+    
     assert out["planet_mask"].shape == (MAX_PLANETS,)
-    assert out["fleet_mask"].shape == (MAX_FLEETS,)
+    
     assert out["planet_mask"].dtype == jnp.bool_
-    assert out["fleet_mask"].dtype == jnp.bool_
 
 
 def test_masked_padding_is_zero():
@@ -53,17 +52,15 @@ def test_masked_padding_is_zero():
     state = reset(11, episode_steps=200)
     out = encode_observation(state, jnp.int32(0))
     planet_features = np.asarray(out["planet_features"])
-    fleet_features = np.asarray(out["fleet_features"])
+    # fleet_features removed
     planet_mask = np.asarray(out["planet_mask"])
-    fleet_mask = np.asarray(out["fleet_mask"])
+    
 
     # Every inactive row is exactly zero.
     inactive_planets = planet_features[~planet_mask]
-    inactive_fleets = fleet_features[~fleet_mask]
+    
     if inactive_planets.size:
         assert np.all(inactive_planets == 0.0)
-    if inactive_fleets.size:
-        assert np.all(inactive_fleets == 0.0)
 
 
 def test_player_relative_flip_is_symmetric():
@@ -87,19 +84,6 @@ def test_player_relative_flip_is_symmetric():
     assert np.allclose(pf0[:, 4:17], pf1[:, 4:17])
 
 
-def test_global_lead_signs_flip():
-    state = reset(5, episode_steps=200)
-    g0 = np.asarray(encode_observation(state, jnp.int32(0))["global_features"])
-    g1 = np.asarray(encode_observation(state, jnp.int32(1))["global_features"])
-    # prod_lead (idx 9) and ship_lead (idx 10) must swap sign between players.
-    assert np.allclose(g0[9], -g1[9])
-    assert np.allclose(g0[10], -g1[10])
-    # Largest ships/production columns must swap between players.
-    assert np.allclose(g0[16], g1[17])
-    assert np.allclose(g0[17], g1[16])
-    assert np.allclose(g0[18], g1[19])
-    assert np.allclose(g0[19], g1[18])
-
 
 def test_planet_rankings_within_subset():
     """ship_rank_all / prod_rank_all should produce values in [0, 1] and be 1.0
@@ -108,13 +92,13 @@ def test_planet_rankings_within_subset():
     out = encode_observation(state, jnp.int32(0))
     pf = np.asarray(out["planet_features"])
     mask = np.asarray(out["planet_mask"])
-    ship_rank = pf[:, 22]
-    prod_rank = pf[:, 23]
+    ship_rank = pf[:, 24]
+    prod_rank = pf[:, 25]
     assert np.all((ship_rank >= 0) & (ship_rank <= 1))
     assert np.all((prod_rank >= 0) & (prod_rank <= 1))
     assert np.all(ship_rank[~mask] == 0)
     # is_my_largest (col 28) should be 0 or 1 only.
-    assert set(np.unique(pf[:, 28])).issubset({0.0, 1.0})
+    assert set(np.unique(pf[:, 30])).issubset({0.0, 1.0})
 
 
 def test_comet_remaining_present_after_spawn():
@@ -130,7 +114,7 @@ def test_comet_remaining_present_after_spawn():
     pf = np.asarray(out["planet_features"])
     is_comet = pf[:, 13] > 0.5
     if is_comet.any():
-        remaining = pf[is_comet, 30]
+        remaining = pf[is_comet, 32]
         assert np.all(remaining >= 0)
         assert np.any(remaining > 0)
 
@@ -173,8 +157,8 @@ def test_encoding_after_step():
         state = step_jit(state, a, a, m, m)
     out = encode_observation(state, jnp.int32(0))
     assert jnp.all(jnp.isfinite(out["planet_features"]))
-    assert jnp.all(jnp.isfinite(out["fleet_features"]))
-    assert jnp.all(jnp.isfinite(out["global_features"]))
+    
+    
     # Turn fraction should be (state.step / episode_steps).
     expected_turn = float(state.step) / float(state.episode_steps)
-    assert np.isclose(float(out["global_features"][0]), expected_turn)
+    assert np.isclose(float(out["planet_features"][0, 33]), expected_turn)

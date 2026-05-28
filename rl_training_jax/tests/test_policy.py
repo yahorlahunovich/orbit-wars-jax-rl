@@ -24,9 +24,6 @@ def _example_batch(batch: int = 2):
     return {
         "planet_features": jnp.zeros((batch, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((batch, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((batch, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.ones((batch, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((batch, GLOBAL_FEATURE_DIM), jnp.float32),
     }
 
 
@@ -97,16 +94,13 @@ def test_padding_does_not_affect_active_outputs():
     example = _example_batch(batch=1)
     # Mark first 10 planets as active, the rest padded.
     planet_mask = jnp.zeros((1, MAX_PLANETS), jnp.bool_).at[:, :10].set(True)
-    fleet_mask = jnp.zeros((1, MAX_FLEETS), jnp.bool_).at[:, :5].set(True)
-    batch_a = {**example, "planet_mask": planet_mask, "fleet_mask": fleet_mask}
+    batch_a = {**example, "planet_mask": planet_mask}
 
     # Perturb only padding rows.
     planet_features_b = example["planet_features"].at[0, 50:, :].set(7.5)
-    fleet_features_b = example["fleet_features"].at[0, 100:, :].set(-3.0)
     batch_b = {
         **batch_a,
         "planet_features": planet_features_b,
-        "fleet_features": fleet_features_b,
     }
 
     params = init_policy(rng, model, batch_a)

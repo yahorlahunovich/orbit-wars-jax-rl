@@ -94,9 +94,6 @@ def test_ppo_loss_runs_and_decreases_with_better_policy():
     example = {
         "planet_features": jnp.ones((N, P, PLANET_FEATURE_DIM), jnp.float32) * 0.1,
         "planet_mask": jnp.ones((N, P), jnp.bool_),
-        "fleet_features": jnp.zeros((N, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.zeros((N, MAX_FLEETS), jnp.bool_).at[:, :4].set(True),
-        "global_features": jnp.zeros((N, GLOBAL_FEATURE_DIM), jnp.float32),
     }
     params = model.init(rng, **example)
 

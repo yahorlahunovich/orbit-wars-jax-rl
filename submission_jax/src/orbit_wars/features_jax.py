@@ -423,9 +423,6 @@ def encode_observation(
     return {
         "planet_features": planet_features,
         "planet_mask": planet_mask,
-        "fleet_features": fleet_features,
-        "fleet_mask": fleet_mask,
-        "global_features": global_features,
     }
 
 

@@ -84,7 +84,6 @@ def bench_jax_policy(batch: int, steps: int, warmup: int) -> float:
     example = {
         "self_features": jnp.zeros((batch, 22), dtype=jnp.float32),
         "candidate_features": jnp.zeros((batch, 49, 28), dtype=jnp.float32),
-        "global_features": jnp.zeros((batch, 16), dtype=jnp.float32),
         "candidate_mask": jnp.ones((batch, 49), dtype=jnp.bool_),
         "ship_bucket_mask": jnp.ones((batch, 49, 5), dtype=jnp.bool_),
         "bucket_features": jnp.zeros((batch, 49, 5, 4), dtype=jnp.float32),
