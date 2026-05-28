@@ -18,6 +18,7 @@ conda run -n ml python scripts/bench_direct.py \
 
 - **`baseline_kaggle526/`** — early baseline (~526 LB)
 - **`kaggle700_current_heuristic/`** — primary RL training opponent (~700 LB)
+- **`lb_highest_1000_search_value/`** — search + learned value function heuristic (1000+ LB, heavy)
 
 Record new snapshots in `docs/BOT_REGISTRY.md`.
 
