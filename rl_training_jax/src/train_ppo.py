@@ -515,8 +515,6 @@ def train(cfg: TrainConfig) -> None:
         flat = {}
         for k in (
             "planet_features", "planet_mask",
-            "fleet_features", "fleet_mask",
-            "global_features",
             "target_idx", "bucket_idx", "log_prob", "source_valid",
             "target_has_bucket", "bucket_valid",
         ):
@@ -557,7 +555,6 @@ def train(cfg: TrainConfig) -> None:
         v_sub = model.apply(
             params,
             planet_features=sub["planet_features"], planet_mask=sub["planet_mask"],
-
         ).value
         ev = float(explained_variance(sub["returns"], v_sub))
 
