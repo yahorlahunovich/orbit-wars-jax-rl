@@ -6,8 +6,9 @@ End-to-end design:
   `jax.vmap(step_jit)` inside a `jax.lax.scan` of length `rollout_steps`.
 - Self-play: both players use the same `params`. Per env we randomly assign
   which player is the learner at reset time; PPO trains on the learner's
-  decision rows only. Opponent's actions are sampled from the same policy
-  (no gradient) and fed to the env.
+  decision rows only.
+- Optional curriculum: train vs `versions/kaggle700_current_heuristic` until a
+  rolling win-rate threshold is met, then continue self-play.
 - Reward: pure terminal +1 / 0 / -1 from `state.rewards[learner_player]`.
   No shaping.
 - GAE: gamma = 0.9999, lambda = 0.95 by default.
@@ -48,6 +49,7 @@ from orbit_wars import (
     encode_observation,
     reset,
 )
+from orbit_wars.heuristic_opponent import batched_heuristic_actions, load_heuristic_agent
 from orbit_wars.rollout import pack_padded_actions, sample_actions
 from orbit_wars.state import OrbitWarsState
 from orbit_wars.step import _maybe_spawn_comet_numpy
@@ -94,6 +96,12 @@ class TrainConfig:
     log_every: int = 1
     checkpoint_every: int = 50
 
+    # Opponent / curriculum
+    opponent: str = "selfplay"  # selfplay | heuristic | curriculum
+    heuristic_win_rate: float = 0.35
+    heuristic_window_episodes: int = 80
+    heuristic_path: str | None = None
+
 
 def load_config(path: str | Path) -> TrainConfig:
     import yaml
@@ -102,6 +110,8 @@ def load_config(path: str | Path) -> TrainConfig:
     env = data.get("env", {})
     model = data.get("model", {})
     ppo = data.get("ppo", {})
+    training = data.get("training", {})
+    heur_path = training.get("heuristic_path")
     return TrainConfig(
         seed=int(data.get("seed", 0)),
         run_name=str(data.get("run_name", "jax_ppo_transformer")),
@@ -126,6 +136,10 @@ def load_config(path: str | Path) -> TrainConfig:
         max_grad_norm=float(ppo.get("max_grad_norm", 0.5)),
         log_every=int(data.get("log_every", 1)),
         checkpoint_every=int(data.get("checkpoint_every", 50)),
+        opponent=str(training.get("opponent", "selfplay")),
+        heuristic_win_rate=float(training.get("heuristic_win_rate", 0.35)),
+        heuristic_window_episodes=int(training.get("heuristic_window_episodes", 80)),
+        heuristic_path=None if heur_path in (None, "null") else str(heur_path),
     )
 
 
@@ -172,10 +186,23 @@ def policy_apply_factory(model: PlanetPolicy):
     return jax.jit(apply_fn)
 
 
-def rollout_step_factory(model: PlanetPolicy):
+def _gather_by_player(zero_t, one_t, learner_players: jnp.ndarray):
+    """Select per-env rows from player-0 or player-1 tensors."""
+    lp = learner_players.astype(jnp.bool_)
+    if zero_t.ndim == 1:
+        return jnp.where(lp, one_t, zero_t)
+    if zero_t.ndim == 2:
+        return jnp.where(lp[:, None], one_t, zero_t)
+    if zero_t.ndim == 3:
+        return jnp.where(lp[:, None, None], one_t, zero_t)
+    return jnp.where(lp[:, None, None, None], one_t, zero_t)
+
+
+def sample_both_players_factory(model: PlanetPolicy):
+    """Sample policy actions for both seats (same params, independent RNG)."""
+
     @jax.jit
-    def step_one(states: OrbitWarsState, params, rng, learner_players):
-        # Player 0 view
+    def sample(states: OrbitWarsState, params, rng):
         rng, k0, k1 = jax.random.split(rng, 3)
         feats0 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(0))
         out0 = model.apply(params, **feats0)
@@ -183,71 +210,111 @@ def rollout_step_factory(model: PlanetPolicy):
         s0 = sample_actions(k0, out0.target_logits, out0.bucket_logits, grid0)
         a0, m0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
 
-        # Player 1 view (same params, fresh randomness)
         feats1 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(1))
         out1 = model.apply(params, **feats1)
         grid1 = jax.vmap(compose_action_grid, in_axes=(0, None))(states, jnp.int32(1))
         s1 = sample_actions(k1, out1.target_logits, out1.bucket_logits, grid1)
         a1, m1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
+        return (a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, rng)
 
-        new_states = jax.vmap(__import__("orbit_wars.step", fromlist=["step_jit"]).step_jit)(
-            states, a0, a1, m0, m1
+    return sample
+
+
+def learner_record_from_samples(
+    learner_players: jnp.ndarray,
+    s0,
+    s1,
+    out0,
+    out1,
+    grid0,
+    grid1,
+    feats0,
+    feats1,
+    new_states: OrbitWarsState,
+) -> dict:
+    learner_feats = jax.tree_util.tree_map(
+        lambda z, o: _gather_by_player(z, o, learner_players), feats0, feats1,
+    )
+    learner_value = _gather_by_player(out0.value, out1.value, learner_players)
+    target_idx = _gather_by_player(s0["target_idx"], s1["target_idx"], learner_players)
+    bucket_idx = _gather_by_player(s0["bucket_idx"], s1["bucket_idx"], learner_players)
+    log_prob = _gather_by_player(s0["log_prob"], s1["log_prob"], learner_players)
+    source_valid = _gather_by_player(s0["source_valid"], s1["source_valid"], learner_players)
+    target_has_bucket = _gather_by_player(
+        jnp.any(grid0["bucket_valid"], axis=-1) & grid0["pair_valid"],
+        jnp.any(grid1["bucket_valid"], axis=-1) & grid1["pair_valid"],
+        learner_players,
+    )
+    bucket_valid = _gather_by_player(grid0["bucket_valid"], grid1["bucket_valid"], learner_players)
+
+    reward = jnp.where(
+        new_states.done & (learner_players == 0),
+        new_states.rewards[:, 0],
+        jnp.where(
+            new_states.done & (learner_players == 1),
+            new_states.rewards[:, 1],
+            jnp.zeros_like(new_states.rewards[:, 0]),
+        ),
+    )
+    return {
+        "planet_features": learner_feats["planet_features"],
+        "planet_mask": learner_feats["planet_mask"],
+        "fleet_features": learner_feats["fleet_features"],
+        "fleet_mask": learner_feats["fleet_mask"],
+        "global_features": learner_feats["global_features"],
+        "target_idx": target_idx,
+        "bucket_idx": bucket_idx,
+        "log_prob": log_prob,
+        "source_valid": source_valid,
+        "target_has_bucket": target_has_bucket,
+        "bucket_valid": bucket_valid,
+        "value": learner_value,
+        "reward": reward,
+        "done": new_states.done,
+    }
+
+
+def rollout_step_selfplay_factory(model: PlanetPolicy):
+    sample = sample_both_players_factory(model)
+    step_jit = __import__("orbit_wars.step", fromlist=["step_jit"]).step_jit
+
+    @jax.jit
+    def step_one(states: OrbitWarsState, params, rng, learner_players):
+        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, rng = sample(
+            states, params, rng,
         )
-
-        # Learner's perspective: gather per-env from (feats0/feats1, out0/out1, grid0/grid1, s0/s1).
-        def gather_by_player(zero_t, one_t):
-            return jnp.where(
-                learner_players.astype(jnp.bool_)[:, None] if zero_t.ndim == 2 else
-                learner_players.astype(jnp.bool_)[:, None, None] if zero_t.ndim == 3 else
-                learner_players.astype(jnp.bool_)[:, None, None, None],
-                one_t, zero_t,
-            ) if zero_t.ndim > 1 else jnp.where(learner_players.astype(jnp.bool_), one_t, zero_t)
-
-        # Per-row info we keep for PPO. All are per-env-time shapes (B, ...).
-        learner_feats = jax.tree_util.tree_map(gather_by_player, feats0, feats1)
-        learner_value = jnp.where(learner_players.astype(jnp.bool_), out1.value, out0.value)
-        target_idx = jnp.where(learner_players.astype(jnp.bool_)[:, None], s1["target_idx"], s0["target_idx"])
-        bucket_idx = jnp.where(learner_players.astype(jnp.bool_)[:, None], s1["bucket_idx"], s0["bucket_idx"])
-        log_prob = jnp.where(learner_players.astype(jnp.bool_)[:, None], s1["log_prob"], s0["log_prob"])
-        source_valid = jnp.where(learner_players.astype(jnp.bool_)[:, None], s1["source_valid"], s0["source_valid"])
-        target_has_bucket = jnp.where(
-            learner_players.astype(jnp.bool_)[:, None, None],
-            jnp.any(grid1["bucket_valid"], axis=-1) & grid1["pair_valid"],
-            jnp.any(grid0["bucket_valid"], axis=-1) & grid0["pair_valid"],
+        new_states = jax.vmap(step_jit)(states, a0, a1, m0, m1)
+        record = learner_record_from_samples(
+            learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, new_states,
         )
-        bucket_valid = jnp.where(
-            learner_players.astype(jnp.bool_)[:, None, None, None],
-            grid1["bucket_valid"], grid0["bucket_valid"],
-        )
+        return new_states, record, rng
 
-        # Terminal reward seen by the learner.
-        reward = jnp.where(
-            new_states.done & (learner_players == 0),
-            new_states.rewards[:, 0],
-            jnp.where(
-                new_states.done & (learner_players == 1),
-                new_states.rewards[:, 1],
-                jnp.zeros_like(new_states.rewards[:, 0]),
-            ),
-        )
-        done = new_states.done
+    return step_one
 
-        record = {
-            "planet_features": learner_feats["planet_features"],
-            "planet_mask": learner_feats["planet_mask"],
-            "fleet_features": learner_feats["fleet_features"],
-            "fleet_mask": learner_feats["fleet_mask"],
-            "global_features": learner_feats["global_features"],
-            "target_idx": target_idx,
-            "bucket_idx": bucket_idx,
-            "log_prob": log_prob,
-            "source_valid": source_valid,
-            "target_has_bucket": target_has_bucket,
-            "bucket_valid": bucket_valid,
-            "value": learner_value,
-            "reward": reward,
-            "done": done,
-        }
+
+def rollout_step_vs_heuristic_factory(model: PlanetPolicy):
+    """Policy learner + frozen heuristic opponent (host-side opponent actions)."""
+    sample = sample_both_players_factory(model)
+    step_jit = __import__("orbit_wars.step", fromlist=["step_jit"]).step_jit
+
+    def step_one(states: OrbitWarsState, params, rng, learner_players, heuristic_agent):
+        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, rng = sample(
+            states, params, rng,
+        )
+        lp_np = np.asarray(learner_players, dtype=np.int32)
+        opp_np = 1 - lp_np
+        ha0, hm0, ha1, hm1 = batched_heuristic_actions(states, opp_np, heuristic_agent)
+
+        lp = learner_players.astype(jnp.bool_)
+        final_a0 = jnp.where(lp[:, None, None], a0, ha0)
+        final_a1 = jnp.where(lp[:, None, None], ha1, a1)
+        final_m0 = jnp.where(lp[:, None], m0, hm0)
+        final_m1 = jnp.where(lp[:, None], hm1, m1)
+
+        new_states = jax.vmap(step_jit)(states, final_a0, final_a1, final_m0, final_m1)
+        record = learner_record_from_samples(
+            learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, new_states,
+        )
         return new_states, record, rng
 
     return step_one
@@ -328,8 +395,21 @@ def train(cfg: TrainConfig) -> None:
     optimizer, _ = make_optimizer(cfg)
     opt_state = optimizer.init(params)
 
-    rollout_step = rollout_step_factory(model)
+    rollout_selfplay = rollout_step_selfplay_factory(model)
+    rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model)
     update_step = make_update_step(model, optimizer, cfg)
+
+    opponent_mode = cfg.opponent.lower()
+    if opponent_mode not in ("selfplay", "heuristic", "curriculum"):
+        raise ValueError(f"unknown opponent mode: {cfg.opponent}")
+    active_mode = "heuristic" if opponent_mode in ("heuristic", "curriculum") else "selfplay"
+    curriculum_switched = False
+
+    heuristic_agent = None
+    if active_mode == "heuristic":
+        heur_path = Path(cfg.heuristic_path) if cfg.heuristic_path else None
+        heuristic_agent = load_heuristic_agent(heur_path)
+        print(f"Heuristic opponent loaded from {heur_path or 'default'}", flush=True)
 
     save_dir = Path(cfg.save_dir) / cfg.run_name
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -341,34 +421,50 @@ def train(cfg: TrainConfig) -> None:
 
     print(
         f"JAX devices: {jax.devices()} | envs={cfg.num_envs} rollout={cfg.rollout_steps} "
-        f"updates={cfg.total_updates}"
+        f"updates={cfg.total_updates} opponent={opponent_mode} active={active_mode}",
+        flush=True,
     )
     print(
-        "update | upd/s | env_sps | rollout_s | train_s | episodes | mean_ret | "
-        "loss | policy | value | entropy | ev | approx_kl | clip_frac"
+        "update | mode | heur_wr | W-L-D | episodes | mean_ret | env_sps | "
+        "loss | policy | value | entropy | ev | kl | clip",
+        flush=True,
     )
 
     t_start = time.perf_counter()
     total_env_steps = 0
     finished_returns_window: list[float] = []
+    heuristic_returns_window: list[float] = []
+    heur_wins = heur_losses = heur_draws = 0
 
     for update_idx in range(1, cfg.total_updates + 1):
-        # ------- rollout -------
         t_rollout = time.perf_counter()
         rollout_records = []
         for _ in range(cfg.rollout_steps):
             states = maybe_spawn_comets_host(states, cfg)
             rng, sub = jax.random.split(rng)
-            states, rec, rng = rollout_step(states, params, sub, learner_players)
+            if active_mode == "selfplay":
+                states, rec, rng = rollout_selfplay(states, params, sub, learner_players)
+            else:
+                states, rec, rng = rollout_vs_heuristic(
+                    states, params, sub, learner_players, heuristic_agent,
+                )
             rollout_records.append(rec)
             done_np = np.asarray(rec["done"])
             reward_np = np.asarray(rec["reward"])
             for i in range(cfg.num_envs):
                 if done_np[i]:
-                    finished_returns_window.append(float(reward_np[i]))
+                    r = float(reward_np[i])
+                    finished_returns_window.append(r)
+                    if active_mode == "heuristic":
+                        heuristic_returns_window.append(r)
+                        if r > 0:
+                            heur_wins += 1
+                        elif r < 0:
+                            heur_losses += 1
+                        else:
+                            heur_draws += 1
             if done_np.any():
                 states, next_seed, new_lp = reset_done_envs(states, done_np, next_seed, cfg)
-                # Update learner_players only for envs that just reset.
                 lp_np = np.asarray(learner_players)
                 lp_np = np.where(done_np, new_lp, lp_np)
                 learner_players = jnp.asarray(lp_np)
@@ -452,21 +548,44 @@ def train(cfg: TrainConfig) -> None:
         ev = float(explained_variance(sub["returns"], v_sub))
 
         elapsed = time.perf_counter() - t_start
-        upd_s = update_idx / elapsed
         env_sps = total_env_steps / elapsed
 
         mean_ret = float(np.mean(finished_returns_window[-50:])) if finished_returns_window else float("nan")
         episodes = len(finished_returns_window)
 
+        window = heuristic_returns_window[-cfg.heuristic_window_episodes :]
+        heur_wr = float(np.mean([1.0 if r > 0 else 0.0 for r in window])) if window else float("nan")
+        wld = f"{heur_wins}-{heur_losses}-{heur_draws}"
+
         if update_idx % cfg.log_every == 0:
             print(
-                f"{update_idx:6d} | {upd_s:5.2f} | {env_sps:7.0f} | {rollout_s:8.1f} | "
-                f"{train_s:6.1f} | {episodes:7d} | "
-                f"{mean_ret:+.3f} | "
+                f"{update_idx:6d} | {active_mode:8s} | "
+                f"{heur_wr if active_mode == 'heuristic' else float('nan'):7.1%} | "
+                f"{wld if active_mode == 'heuristic' else 'n/a':>5s} | "
+                f"{episodes:7d} | {mean_ret:+.3f} | {env_sps:7.0f} | "
                 f"{metrics_accum['loss']:.4f} | {metrics_accum['policy_loss']:+.4f} | "
                 f"{metrics_accum['value_loss']:.4f} | {metrics_accum['entropy']:.3f} | "
-                f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f}"
+                f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f}",
+                flush=True,
             )
+
+        if (
+            opponent_mode == "curriculum"
+            and active_mode == "heuristic"
+            and not curriculum_switched
+            and len(window) >= cfg.heuristic_window_episodes
+            and heur_wr >= cfg.heuristic_win_rate
+        ):
+            active_mode = "selfplay"
+            curriculum_switched = True
+            print("=" * 72, flush=True)
+            print(
+                f"CURRICULUM SWITCH at update {update_idx}: "
+                f"heuristic win rate {heur_wr:.1%} >= {cfg.heuristic_win_rate:.1%}. "
+                f"Continuing with self-play for remaining updates.",
+                flush=True,
+            )
+            print("=" * 72, flush=True)
 
         if update_idx % cfg.checkpoint_every == 0 or update_idx == cfg.total_updates:
             blob = np.frombuffer(flax.serialization.to_bytes(params), dtype=np.uint8)
@@ -474,7 +593,7 @@ def train(cfg: TrainConfig) -> None:
             np.savez(save_dir / f"ckpt_{update_idx:06d}.npz", update=update_idx, params=blob)
 
     total_elapsed = time.perf_counter() - t_start
-    print(f"Done. total_env_steps={total_env_steps} elapsed={total_elapsed:.1f}s")
+    print(f"Done. total_env_steps={total_env_steps} elapsed={total_elapsed:.1f}s", flush=True)
 
 
 def main() -> None:

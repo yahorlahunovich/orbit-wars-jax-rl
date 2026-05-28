@@ -98,7 +98,7 @@ def _decode_moves(
     pair_valid = np.asarray(grid["pair_valid"])               # (P, P)
     bucket_valid = np.asarray(grid["bucket_valid"])           # (P, P, B)
     source_valid = np.asarray(grid["source_valid"])           # (P,)
-    angle_grid = np.asarray(grid["angle"])                    # (P, P)
+    angle_grid = np.asarray(grid["angle"])                    # (P, P, B)
     ship_counts = np.asarray(grid["ship_counts"])             # (P, P, B)
     from_ids = np.asarray(grid["from_ids"])                   # (P,)
 
@@ -113,7 +113,7 @@ def _decode_moves(
         t_logits = np.where(target_mask_s, target_logits[s], -1e9)
         t = int(np.argmax(t_logits))
 
-        bucket_mask_t = bucket_valid[s, t]                     # (B,)
+        bucket_mask_t = bucket_valid[s, t] & np.asarray(grid["full_valid"])[s, t]                     # (B,)
         if not bucket_mask_t.any():
             continue
         b_logits = np.where(bucket_mask_t, bucket_logits[s], -1e9)
@@ -121,7 +121,7 @@ def _decode_moves(
 
         moves.append([
             float(from_ids[s]),
-            float(angle_grid[s, t]),
+            float(angle_grid[s, t, b]),
             int(ship_counts[s, t, b]),
         ])
         if len(moves) >= MAX_MOVES_PER_PLAYER:

@@ -7,12 +7,18 @@ alwaysApply: true
 
 # Orbit Wars Cursor Rules
 
-RL-first project. Active code: `rl_training/`. Heuristic bots: `versions/` only.
+RL-first project.
+
+- Active stack: `rl_training_jax/` (JAX/Flax Transformer PPO).
+- Legacy stack: `rl_training/` (PyTorch PPO + BC reference).
+- Heuristic bots: `versions/` only.
 
 ## Source of truth
 
-- Training: `rl_training/src/`
-- Configs: `rl_training/configs/`
+- JAX training: `rl_training_jax/src/`
+- JAX configs: `rl_training_jax/configs/`
+- Legacy training: `rl_training/src/`
+- Legacy configs: `rl_training/configs/`
 - Heuristic opponent: `versions/kaggle700_current_heuristic/`
 - Fast env: `analysis/fast_kaggle_env/`
 
@@ -25,15 +31,15 @@ RL-first project. Active code: `rl_training/`. Heuristic bots: `versions/` only.
 ## Work pattern
 
 1. Read `docs/RL_TRAINING_NOTES.md`
-2. Change `rl_training/src/` or configs
-3. Smoke: `python -m src.train --config configs/smoke_ppo.yaml --no-bc-init`
-4. Eval vs heuristic: `scripts/eval_policy.py --baseline heuristic`
+2. For active work, change `rl_training_jax/src/` or JAX configs
+3. Smoke JAX: `PYTHONPATH=src python -m train_ppo --config configs/smoke_transformer.yaml`
+4. For Kaggle runs, follow `docs/KAGGLE_GUIDE.md`
 
 ## Commands
 
 ```bash
-cd rl_training
-conda run -n ml python -m src.train --config configs/smoke_ppo.yaml --no-bc-init
+cd rl_training_jax
+PYTHONPATH=src conda run -n ml python -m train_ppo --config configs/smoke_transformer.yaml
 ```
 
 ```bash
@@ -44,3 +50,8 @@ conda run -n ml python scripts/bench_direct.py \
 ```
 
 GPU-heavy BC/PPO: tell user explicitly and give Kaggle `--device cuda` commands.
+
+JAX/T4 memory defaults:
+
+- `num_envs: 32`
+- `minibatch_size: 256`

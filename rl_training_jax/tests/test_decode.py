@@ -34,11 +34,13 @@ def test_ship_counts_monotone_in_source():
 
 
 def test_ship_count_floor_and_minimum():
-    """All buckets must produce integer-valued ship counts >= 1."""
-    sc = ship_counts_for_buckets(jnp.float32(3.0), jnp.float32(2.0))
+    """All buckets must produce integer-valued ship counts >= MIN_LAUNCH_SHIPS."""
+    from orbit_wars.decode import MIN_LAUNCH_SHIPS
+
+    sc = ship_counts_for_buckets(jnp.float32(20.0), jnp.float32(2.0))
     arr = np.asarray(sc)
     assert arr.shape == (BUCKET_COUNT,)
-    assert np.all(arr >= 1.0)
+    assert np.all(arr >= MIN_LAUNCH_SHIPS)
     assert np.all(arr == np.floor(arr))
 
 
@@ -49,9 +51,8 @@ def test_bucket_validity_respects_source_cap():
     # Capture buckets (5, 6) need target_ships+ ships -> 101, 102 -> too many.
     assert not arr[5]
     assert not arr[6]
-    # Fractional buckets (0..4) with source=5 -> 1..5 ships -> all valid.
-    assert np.all(arr[:5])
-    assert arr[7]  # constant bucket = 4
+    # Fractional buckets with source=5 -> min 4 ships -> all valid except capture.
+    assert np.all(arr[[0, 1, 2, 3, 4, 7]])
 
 
 def test_path_crosses_sun_diagonal():
@@ -85,8 +86,9 @@ def test_compose_action_grid_shapes():
     state = reset(0, episode_steps=200)
     grid = compose_action_grid(state, jnp.int32(0))
     assert grid["source_valid"].shape == (MAX_PLANETS,)
-    assert grid["angle"].shape == (MAX_PLANETS, MAX_PLANETS)
-    assert grid["sun_blocks"].shape == (MAX_PLANETS, MAX_PLANETS)
+    assert grid["angle"].shape == (MAX_PLANETS, MAX_PLANETS, BUCKET_COUNT)
+    assert grid["sun_blocks"].shape == (MAX_PLANETS, MAX_PLANETS, BUCKET_COUNT)
+    assert grid["planet_blocks"].shape == (MAX_PLANETS, MAX_PLANETS, BUCKET_COUNT)
     assert grid["ship_counts"].shape == (MAX_PLANETS, MAX_PLANETS, BUCKET_COUNT)
     assert grid["bucket_valid"].shape == (MAX_PLANETS, MAX_PLANETS, BUCKET_COUNT)
     assert grid["full_valid"].shape == (MAX_PLANETS, MAX_PLANETS, BUCKET_COUNT)
@@ -143,7 +145,7 @@ def test_decoded_move_executes_in_env():
     s_idx, t_idx, b_idx = idxs[0]
 
     from_id = float(grid["from_ids"][s_idx])
-    angle = float(grid["angle"][s_idx, t_idx])
+    angle = float(grid["angle"][s_idx, t_idx, b_idx])
     ships = int(grid["ship_counts"][s_idx, t_idx, b_idx])
     move = [[from_id, angle, ships]]
     state2 = step(state, [move, []])

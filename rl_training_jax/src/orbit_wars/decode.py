@@ -7,7 +7,7 @@ over batch × source.
 
 Ship-bucket scheme (BUCKET_COUNT = 8):
 
-    0  10%  of source ships    (light probe)
+    0  25%  of source ships    (min 4 ships)
     1  25%  of source ships
     2  50%  of source ships
     3  75%  of source ships
@@ -34,16 +34,26 @@ import jax
 import jax.numpy as jnp
 
 from .constants import CENTER, SUN_RADIUS
-from .geometry import point_to_segment_distance
+from .geometry import (
+    estimate_intercept_angles,
+    is_orbiting_planet,
+    point_to_segment_distance,
+    safe_angle,
+    sun_hit,
+)
 from .state import OrbitWarsState
 
 BUCKET_COUNT = 8
+MIN_LAUNCH_SHIPS = 4
+SUN_PATH_MARGIN = 1.5
+PATH_PLANET_MARGIN = 1.0
+INTERCEPT_ITERATIONS = 25
 
 # Per-bucket coefficients: ship_count = max(MIN, src*src_frac + tgt*tgt_frac + plus)
-_SRC_FRAC = jnp.array([0.10, 0.25, 0.50, 0.75, 1.00, 0.00, 0.50, 0.00], dtype=jnp.float32)
+_SRC_FRAC = jnp.array([0.25, 0.25, 0.50, 0.75, 1.00, 0.00, 0.50, 0.00], dtype=jnp.float32)
 _TGT_FRAC = jnp.array([0.00, 0.00, 0.00, 0.00, 0.00, 1.00, 1.00, 0.00], dtype=jnp.float32)
 _PLUS = jnp.array([0.00, 0.00, 0.00, 0.00, 0.00, 1.00, 0.00, 4.00], dtype=jnp.float32)
-_MIN = jnp.array([1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00], dtype=jnp.float32)
+_MIN = jnp.full((BUCKET_COUNT,), float(MIN_LAUNCH_SHIPS), dtype=jnp.float32)
 
 # Launch offset to avoid spawning fleets inside the source planet.
 LAUNCH_OFFSET_PADDING = 0.1
@@ -79,15 +89,50 @@ def bucket_validity_mask(
 def path_crosses_sun(
     src_x: jnp.ndarray, src_y: jnp.ndarray,
     tgt_x: jnp.ndarray, tgt_y: jnp.ndarray,
+    margin: float = 0.0,
 ) -> jnp.ndarray:
-    """Conservative check: does the straight segment src→tgt pass within
-    SUN_RADIUS of the sun centre? Matches the env's `sun_hit` semantics.
+    """Does the straight segment src→tgt pass within SUN_RADIUS (+margin) of centre?"""
+    return sun_hit(src_x, src_y, tgt_x, tgt_y, margin=margin)
+
+
+def path_blocked_by_planets(
+    start_x: jnp.ndarray,
+    start_y: jnp.ndarray,
+    aim_x: jnp.ndarray,
+    aim_y: jnp.ndarray,
+    planet_x: jnp.ndarray,
+    planet_y: jnp.ndarray,
+    planet_radius: jnp.ndarray,
+    planet_active: jnp.ndarray,
+    margin: float = PATH_PLANET_MARGIN,
+) -> jnp.ndarray:
+    """True when a third active planet intersects the launch→aim segment.
+
+    Shape: inputs `(P_src, P_tgt, B)` for start/aim; planet arrays `(P,)`.
+    Returns `(P_src, P_tgt, B)`.
     """
-    d = point_to_segment_distance(
-        jnp.float32(CENTER), jnp.float32(CENTER),
-        src_x, src_y, tgt_x, tgt_y,
+    p = planet_x.shape[0]
+    slot = jnp.arange(p)
+    src_i = slot[:, None, None, None]
+    tgt_i = slot[None, :, None, None]
+    obs_i = slot[None, None, :, None]
+
+    is_obstacle = (
+        planet_active[None, None, :, None]
+        & (obs_i != src_i)
+        & (obs_i != tgt_i)
     )
-    return d < SUN_RADIUS
+    obs_r = (planet_radius + margin)[None, None, :, None]
+    ox = planet_x[None, None, :, None]
+    oy = planet_y[None, None, :, None]
+
+    sx = start_x[:, :, None, :]
+    sy = start_y[:, :, None, :]
+    ax = aim_x[:, :, None, :]
+    ay = aim_y[:, :, None, :]
+
+    d = point_to_segment_distance(ox, oy, sx, sy, ax, ay)
+    return jnp.any((d <= obs_r) & is_obstacle, axis=2)
 
 
 def launch_angle(
@@ -110,14 +155,15 @@ def compose_action_grid(
 
         source_valid   (P,)             bool          source planet owned by player
         target_valid   (P,)             bool          target planet is active
-        angle          (P, P)           float32       atan2 aim
-        sun_blocks     (P, P)           bool          true if path passes through sun
+        angle          (P, P, BUCKETS)  float32       safe intercept aim per bucket
+        sun_blocks     (P, P, BUCKETS)  bool          launch→aim crosses sun
+        planet_blocks  (P, P, BUCKETS)  bool          another planet blocks path
         self_target    (P, P)           bool          true on the diagonal
         target_valid_pair (P, P)        bool          target_valid AND not self
         ship_counts    (P, P, BUCKETS)  float32       per-bucket ship count to send
         bucket_valid   (P, P, BUCKETS)  bool          ship count fits source's reserve
-        pair_valid     (P, P)           bool          source_valid AND target_valid_pair AND NOT sun_blocks
-        full_valid     (P, P, BUCKETS)  bool          pair_valid AND bucket_valid
+        pair_valid     (P, P)           bool          source_valid AND target_valid_pair
+        full_valid     (P, P, BUCKETS)  bool          pair & bucket & !sun & !planet block
         from_ids       (P,)             float32       planet id per source slot
     """
     planets = state.planets
@@ -132,27 +178,47 @@ def compose_action_grid(
     radius = planets[:, 4]
     ships = planets[:, 5]
 
-    sx = x[:, None]                    # (P, 1)
-    sy = y[:, None]
-    tx = x[None, :]                    # (1, P)
-    ty = y[None, :]
-
-    angle = launch_angle(sx, sy, tx, ty)             # (P, P)
-    # Compute the actual launch start position (just outside the source planet)
-    # so the sun check matches what the env will see.
-    start_x = sx + jnp.cos(angle) * (radius[:, None] + LAUNCH_OFFSET_PADDING)
-    start_y = sy + jnp.sin(angle) * (radius[:, None] + LAUNCH_OFFSET_PADDING)
-    sun_blocks = path_crosses_sun(start_x, start_y, tx, ty)
-
-    self_target = jnp.eye(planets.shape[0], dtype=jnp.bool_)
-    target_valid_pair = target_valid[None, :] & (~self_target)
-    pair_valid = source_valid[:, None] & target_valid_pair & (~sun_blocks)
+    tgt_orbiting = is_orbiting_planet(x, y, radius)  # (P,)
 
     src_ships_grid = ships[:, None]                  # (P, 1)
     tgt_ships_grid = ships[None, :]                  # (1, P)
     ship_counts = ship_counts_for_buckets(src_ships_grid, tgt_ships_grid)  # (P, P, B)
+
+    p_count = planets.shape[0]
+    bucket_axis = ship_counts.shape[-1]
+    src_x_b = jnp.broadcast_to(x[:, None, None], (p_count, p_count, bucket_axis))
+    src_y_b = jnp.broadcast_to(y[:, None, None], (p_count, p_count, bucket_axis))
+    tgt_x_b = jnp.broadcast_to(x[None, :, None], (p_count, p_count, bucket_axis))
+    tgt_y_b = jnp.broadcast_to(y[None, :, None], (p_count, p_count, bucket_axis))
+    tgt_orb_b = jnp.broadcast_to(
+        tgt_orbiting[None, :, None], (p_count, p_count, bucket_axis),
+    )
+
+    _raw_angle, aim_x, aim_y = estimate_intercept_angles(
+        src_x_b, src_y_b, tgt_x_b, tgt_y_b, tgt_orb_b, ship_counts,
+        state.angular_velocity, state.ship_speed, n_iter=INTERCEPT_ITERATIONS,
+    )
+
+    center_x = jnp.broadcast_to(x[:, None, None], (p_count, p_count, bucket_axis))
+    center_y = jnp.broadcast_to(y[:, None, None], (p_count, p_count, bucket_axis))
+    # Launch direction toward intercept; detour if the centre→aim segment crosses the sun.
+    angle = safe_angle(center_x, center_y, aim_x, aim_y, sun_margin=SUN_PATH_MARGIN)
+
+    src_radius_b = jnp.broadcast_to(radius[:, None, None], (p_count, p_count, bucket_axis))
+    start_x = center_x + jnp.cos(angle) * (src_radius_b + LAUNCH_OFFSET_PADDING)
+    start_y = center_y + jnp.sin(angle) * (src_radius_b + LAUNCH_OFFSET_PADDING)
+    # Mask when centre→aim crosses the sun (matches heuristic pre-filter).
+    sun_blocks = path_crosses_sun(center_x, center_y, aim_x, aim_y, margin=SUN_PATH_MARGIN)
+    planet_blocks = path_blocked_by_planets(
+        center_x, center_y, aim_x, aim_y, x, y, radius, active, margin=PATH_PLANET_MARGIN,
+    )
+
+    self_target = jnp.eye(planets.shape[0], dtype=jnp.bool_)
+    target_valid_pair = target_valid[None, :] & (~self_target)
+    pair_valid = source_valid[:, None] & target_valid_pair
+
     bucket_valid = bucket_validity_mask(ship_counts, src_ships_grid)       # (P, P, B)
-    full_valid = pair_valid[..., None] & bucket_valid
+    full_valid = pair_valid[..., None] & bucket_valid & (~sun_blocks) & (~planet_blocks)
 
     from_ids = planets[:, 0]                         # (P,) float
 
@@ -160,7 +226,10 @@ def compose_action_grid(
         "source_valid": source_valid,
         "target_valid": target_valid,
         "angle": angle,
+        "aim_x": aim_x,
+        "aim_y": aim_y,
         "sun_blocks": sun_blocks,
+        "planet_blocks": planet_blocks,
         "self_target": self_target,
         "target_valid_pair": target_valid_pair,
         "ship_counts": ship_counts,

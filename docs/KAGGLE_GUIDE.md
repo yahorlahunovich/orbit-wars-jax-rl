@@ -66,7 +66,37 @@ When you attach the dataset to a notebook, files appear at
 You can stop cell 3 at any time (the trainer checkpoints every 100 updates).
 Cell 4 picks up the latest checkpoint.
 
-## 3. Tuning `transformer_selfplay.yaml` on Kaggle
+## 3. Training configs
+
+| Config | Use case |
+|--------|----------|
+| `smoke_transformer.yaml` | Local/Kaggle sanity check (~20 updates, self-play) |
+| `transformer_curriculum.yaml` | **Recommended Kaggle run** — vs heuristic until 35% win rate, then self-play |
+| `transformer_selfplay.yaml` | Pure self-play ablation |
+
+Curriculum logs every 5 updates:
+
+```
+update | mode | heur_wr | W-L-D | episodes | mean_ret | env_sps | loss | ...
+```
+
+When rolling win rate vs heuristic hits `heuristic_win_rate` (default 35%), you'll see:
+
+```
+CURRICULUM SWITCH at update N: heuristic win rate 35.x% >= 35.0%. Continuing with self-play...
+```
+
+## 4. GitHub → Kaggle workflow (recommended)
+
+1. Push this repo to GitHub (include `versions/kaggle700_current_heuristic/`).
+2. Create a Kaggle notebook with GPU + Internet ON.
+3. Paste cells from `kaggle/kaggle_train.py` (clone → smoke → curriculum train → export).
+4. Set `GITHUB_REPO` in Cell 1 to your repo URL.
+5. Run all cells. Tail logs in the notebook output every 5 updates.
+
+Checkpoints land in `/kaggle/working/orbit-wars/rl_training_jax/artifacts/jax_ppo_curriculum/`.
+
+## 5. Tuning `transformer_curriculum.yaml` on Kaggle
 
 The defaults are sized for a Kaggle session (~9 h wall-clock budget):
 

@@ -154,14 +154,14 @@ def pack_padded_actions(
     """
     b, p = target_idx.shape
     from_ids = action_grid["from_ids"]                          # (B, P)
-    angle_grid = action_grid["angle"]                           # (B, P, P)
+    angle_grid = action_grid["angle"]                           # (B, P, P, BUCKETS)
     ship_counts = action_grid["ship_counts"]                    # (B, P, P, BUCKETS)
 
     # Gather chosen angle/ship_count per source.
     s_range = jnp.arange(p, dtype=jnp.int32)
     b_range = jnp.arange(b, dtype=jnp.int32)
     bi, si = jnp.meshgrid(b_range, s_range, indexing="ij")
-    angle = angle_grid[bi, si, target_idx]                      # (B, P)
+    angle = angle_grid[bi, si, target_idx, bucket_idx]          # (B, P)
     ships = ship_counts[bi, si, target_idx, bucket_idx]         # (B, P)
 
     # Build the per-source row.
