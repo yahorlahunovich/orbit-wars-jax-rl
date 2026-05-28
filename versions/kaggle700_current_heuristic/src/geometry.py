@@ -20,23 +20,32 @@ def fleet_speed(ships: int, max_speed: float = MAX_SHIP_SPEED) -> float:
     return 1.0 + (max_speed - 1.0) * min(1.0, scaled)
 
 
+def point_segment_distance_sq(
+    px: float, py: float,
+    ax: float, ay: float,
+    bx: float, by: float,
+) -> float:
+    dx = bx - ax
+    dy = by - ay
+    denom = dx * dx + dy * dy
+    if denom == 0.0:
+        return (px - ax) ** 2 + (py - ay) ** 2
+    t = ((px - ax) * dx + (py - ay) * dy) / denom
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    cx = ax + t * dx
+    cy = ay + t * dy
+    return (px - cx) ** 2 + (py - cy) ** 2
+
+
 def point_segment_distance(
     point: tuple[float, float],
     a: tuple[float, float],
     b: tuple[float, float],
 ) -> float:
-    px, py = point
-    ax, ay = a
-    bx, by = b
-    dx = bx - ax
-    dy = by - ay
-    denom = dx * dx + dy * dy
-    if denom == 0.0:
-        return distance_xy(point, a)
-    t = ((px - ax) * dx + (py - ay) * dy) / denom
-    t = max(0.0, min(1.0, t))
-    closest = (ax + t * dx, ay + t * dy)
-    return distance_xy(point, closest)
+    return math.sqrt(point_segment_distance_sq(point[0], point[1], a[0], a[1], b[0], b[1]))
 
 
 def segment_intersects_circle(
@@ -45,7 +54,7 @@ def segment_intersects_circle(
     center: tuple[float, float],
     radius: float,
 ) -> bool:
-    return point_segment_distance(center, a, b) <= radius
+    return point_segment_distance_sq(center[0], center[1], a[0], a[1], b[0], b[1]) <= radius * radius
 
 
 def path_hits_sun(
@@ -53,7 +62,8 @@ def path_hits_sun(
     b: tuple[float, float],
     margin: float = 0.0,
 ) -> bool:
-    return segment_intersects_circle(a, b, CENTER, SUN_RADIUS + margin)
+    r = SUN_RADIUS + margin
+    return point_segment_distance_sq(CENTER[0], CENTER[1], a[0], a[1], b[0], b[1]) <= r * r
 
 
 def segment_clear_of_circles(
@@ -62,8 +72,10 @@ def segment_clear_of_circles(
     circles: list[tuple[tuple[float, float], float]],
 ) -> bool:
     """True if segment ab does not intersect any circle (each circle = (center, radius))."""
-    for center, radius in circles:
-        if point_segment_distance(center, a, b) <= radius:
+    ax, ay = a
+    bx, by = b
+    for (cx, cy), radius in circles:
+        if point_segment_distance_sq(cx, cy, ax, ay, bx, by) <= radius * radius:
             return False
     return True
 
@@ -112,20 +124,18 @@ def estimate_intercept(
 
 
 def fleet_ray_closest_to_point(
-    fleet: Fleet,
+    fx: float, fy: float,
+    sp: float, ux: float, uy: float,
     px: float,
     py: float,
 ) -> tuple[float, float]:
     """Forward ray from fleet: position + t * speed * (cos a, sin a), t >= 0. Returns (t_close, distance)."""
-    sp = fleet_speed(fleet.ships)
-    ux = math.cos(fleet.angle)
-    uy = math.sin(fleet.angle)
-    rx = px - fleet.x
-    ry = py - fleet.y
+    rx = px - fx
+    ry = py - fy
     dot_ru = rx * ux + ry * uy
     if dot_ru <= 0.0:
-        return 0.0, distance_xy((fleet.x, fleet.y), (px, py))
+        return 0.0, distance_xy((fx, fy), (px, py))
     t_close = dot_ru / sp
-    cx = fleet.x + sp * ux * t_close
-    cy = fleet.y + sp * uy * t_close
+    cx = fx + sp * ux * t_close
+    cy = fy + sp * uy * t_close
     return t_close, distance_xy((px, py), (cx, cy))

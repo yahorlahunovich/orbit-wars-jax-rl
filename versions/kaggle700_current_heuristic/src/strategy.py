@@ -167,8 +167,15 @@ def fleet_target_planet(
 ) -> tuple[int, float] | None:
     """Find which planet a fleet is heading to (smallest eta with d_close <= radius+slop)."""
     best: tuple[float, int] | None = None
+    
+    import math
+    from src.geometry import fleet_speed
+    sp = fleet_speed(fleet.ships)
+    ux = math.cos(fleet.angle)
+    uy = math.sin(fleet.angle)
+    
     for p in planets:
-        t_close, d_close = fleet_ray_closest_to_point(fleet, p.x, p.y)
+        t_close, d_close = fleet_ray_closest_to_point(fleet.x, fleet.y, sp, ux, uy, p.x, p.y)
         if t_close <= 0:
             continue
         if d_close <= p.radius + slop:
@@ -234,15 +241,26 @@ def aggregate_threats_by_planet(
     slop = float(cfg["threat_hit_slop"])
     min_ships = int(cfg["min_threat_ships"])
     horizon = float(cfg["threat_horizon_turns"])
+    
+    import math
+    from src.geometry import fleet_speed
+    
+    my_planets = [p for p in state.planets if p.owner == state.player]
+    if not my_planets:
+        return out
+
     for f in state.fleets:
         if f.owner == state.player:
             continue
         if int(f.ships) < min_ships:
             continue
-        for p in state.planets:
-            if p.owner != state.player:
-                continue
-            t_close, d_close = fleet_ray_closest_to_point(f, p.x, p.y)
+            
+        sp = fleet_speed(f.ships)
+        ux = math.cos(f.angle)
+        uy = math.sin(f.angle)
+            
+        for p in my_planets:
+            t_close, d_close = fleet_ray_closest_to_point(f.x, f.y, sp, ux, uy, p.x, p.y)
             if t_close <= 0 or t_close > horizon:
                 continue
             if d_close > p.radius + slop:
@@ -283,21 +301,28 @@ def planet_deficit(
 
 # ---------- Path safety ----------
 
-def obstacles_for_path(
-    state: GameState, source_id: int, target_id: int, cfg: dict[str, Any]
-) -> list[tuple[tuple[float, float], float]]:
-    """Sun and non-(source/target) enemy planets as collision circles."""
+def build_base_obstacles(state: GameState, cfg: dict[str, Any]) -> dict[int, tuple[tuple[float, float], float]]:
     margin = float(cfg["path_circle_margin"])
+    obs: dict[int, tuple[tuple[float, float], float]] = {}
+    for p in state.planets:
+        if p.owner == state.player or p.owner == NEUTRAL:
+            continue
+        obs[p.id] = ((p.x, p.y), p.radius + margin)
+    return obs
+
+
+def obstacles_for_target(
+    base_obstacles: dict[int, tuple[tuple[float, float], float]],
+    target_id: int,
+    cfg: dict[str, Any]
+) -> list[tuple[tuple[float, float], float]]:
     sun_margin = float(cfg["avoid_sun_margin"])
     obs: list[tuple[tuple[float, float], float]] = [
         (CENTER, SUN_RADIUS + sun_margin)
     ]
-    for p in state.planets:
-        if p.id == source_id or p.id == target_id:
-            continue
-        if p.owner == state.player or p.owner == NEUTRAL:
-            continue
-        obs.append(((p.x, p.y), p.radius + margin))
+    for pid, circle in base_obstacles.items():
+        if pid != target_id:
+            obs.append(circle)
     return obs
 
 
@@ -469,6 +494,7 @@ def try_expansion_for_target(
     committed: defaultdict[int, int],
     arrivals: dict[int, list[tuple[float, int, int]]],
     threats_by_planet: dict[int, list[tuple[float, Fleet]]],
+    obstacles: list[tuple[tuple[float, float], float]],
 ) -> tuple[int, float, int, float, float] | None:
     """Returns (source_id, angle, send, travel_time, score) or None."""
     arrivals_at_target = arrivals.get(target.id, [])
@@ -490,7 +516,6 @@ def try_expansion_for_target(
         if avail < 1:
             continue
 
-        obstacles = obstacles_for_path(state, source.id, target.id, cfg)
         got = find_capture_launch(
             state, source, target, avail, cfg, arrivals_at_target, obstacles, patient
         )
@@ -537,16 +562,27 @@ def choose_expansion_moves(
     if not targets:
         return moves
 
+    base_obs = build_base_obstacles(state, cfg)
+    obstacles_per_target = {
+        t.id: obstacles_for_target(base_obs, t.id, cfg) for t in targets
+    }
+
     taken: set[int] = set()
+    target_cache: dict[int, tuple[int, float, int, float, float] | None] = {}
+
     while True:
         best_key: tuple[float, float, float] | None = None
-        best_pick: tuple[int, float, int, int] | None = None
+        best_pick: tuple[int, int, float, int] | None = None
         for target in targets:
             if target.id in taken:
                 continue
-            got = try_expansion_for_target(
-                state, target, my_planets, cfg, committed, arrivals, threats_by_planet
-            )
+            
+            if target.id not in target_cache:
+                target_cache[target.id] = try_expansion_for_target(
+                    state, target, my_planets, cfg, committed, arrivals, threats_by_planet, obstacles_per_target[target.id]
+                )
+                
+            got = target_cache[target.id]
             if got is None:
                 continue
             source_id, angle, send_ships, travel_time, score = got
@@ -564,6 +600,12 @@ def choose_expansion_moves(
         moves.append([sid, ang, send])
         committed[sid] += send
         taken.add(tid)
+        
+        # Invalidate cache for any target that was relying on 'sid', because its available ships just decreased
+        for cache_tid in list(target_cache.keys()):
+            cache_got = target_cache[cache_tid]
+            if cache_got is not None and cache_got[0] == sid:
+                del target_cache[cache_tid]
 
     return moves
 
@@ -591,6 +633,8 @@ def choose_defense_moves(
         key=lambda kv: kv[1][0][0] if kv[1] else 1e9,
     )
 
+    base_obs = build_base_obstacles(state, cfg)
+
     for pid, threats in planet_threats:
         if not threats:
             continue
@@ -605,6 +649,8 @@ def choose_defense_moves(
 
         earliest_threat_eta = threats[0][0]
         remaining_deficit = deficit + margin
+        
+        obstacles = obstacles_for_target(base_obs, threatened.id, cfg)
 
         for defender in sorted(
             my_planets,
@@ -623,7 +669,6 @@ def choose_defense_moves(
             angle, tt, _d, _spd, pred_xy = estimate_intercept(
                 defender, threatened, send_try, state.angular_velocity
             )
-            obstacles = obstacles_for_path(state, defender.id, threatened.id, cfg)
             if not segment_clear_of_circles((defender.x, defender.y), pred_xy, obstacles):
                 continue
             if tt >= earliest_threat_eta:

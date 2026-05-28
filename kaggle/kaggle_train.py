@@ -1,55 +1,75 @@
 """Copy-paste into a Kaggle GPU notebook (one cell per `# ---- Cell N` marker).
 
-Recommended flow: push this repo to GitHub, clone in Cell 1, train with
-curriculum (heuristic -> self-play), export submission.
-
 Settings: Accelerator GPU T4 x2, Internet ON.
+Run cells in order: 1 → 2 → 3 → 4.
 """
 
-# ---- Cell 1: clone repo + install JAX GPU -----------------------------------
-import os
-import shutil
-import subprocess
-import sys
+# ---- Cell 1: clone repo + install deps --------------------------------------
+import importlib, os, subprocess, sys
 from pathlib import Path
 
-# Set your GitHub repo (HTTPS works without SSH keys on Kaggle).
-GITHUB_REPO = "https://github.com/yahorlahunovich/orbit-wars-jax-rl.git"
-BRANCH = "main"
+GITHUB_REPO = "yahorlahunovich/orbit-wars-jax-rl"
+GITHUB_TOKEN = ""   # <-- paste the freshly-generated token
 
-WORK_ROOT = Path("/kaggle/working/orbit-wars")
+WORK_ROOT = Path("/kaggle/working/repo")
 RL_DIR = WORK_ROOT / "rl_training_jax"
 
 if WORK_ROOT.exists():
-    shutil.rmtree(WORK_ROOT)
-subprocess.check_call(["git", "clone", "--depth", "1", "--branch", BRANCH, GITHUB_REPO, str(WORK_ROOT)])
-print(f"Cloned -> {WORK_ROOT}")
+    subprocess.check_call(["git", "-C", str(WORK_ROOT), "pull", "--quiet"])
+    print(f"Updated {WORK_ROOT}")
+else:
+    clone_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_REPO}.git"
+    subprocess.check_call([
+        "git", "clone", "--depth=1", "--quiet", clone_url, str(WORK_ROOT)
+    ])
+    print(f"Cloned -> {WORK_ROOT}")
+
+assert RL_DIR.exists(), f"rl_training_jax missing under {WORK_ROOT}"
 
 try:
     import jax
-    if not any(d.platform == "gpu" for d in jax.devices()):
-        raise RuntimeError("CPU-only jax")
-    print(f"jax devices: {jax.devices()}")
+    devs = jax.devices()
+    if not any(d.platform == "gpu" for d in devs):
+        raise RuntimeError("jax is CPU-only")
+    print(f"jax devices: {devs}")
 except Exception as exc:
-    print(f"Installing jax GPU: {exc}")
+    print(f"installing jax[cuda12_pip]: {exc}")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
-        "jax[cuda12_pip]==0.4.30",
+        "--upgrade", "jax[cuda12_pip]==0.4.30",
         "-f", "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
     ])
+    import jax
+    importlib.reload(jax)
+    print(f"jax devices after install: {jax.devices()}")
 
 for pkg in ("optax", "flax", "pyyaml"):
+    mod = "yaml" if pkg == "pyyaml" else pkg
     try:
-        __import__(pkg if pkg != "pyyaml" else "yaml")
+        __import__(mod)
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 TRAIN_ENV = os.environ.copy()
 TRAIN_ENV["PYTHONPATH"] = f"{RL_DIR}/src" + os.pathsep + TRAIN_ENV.get("PYTHONPATH", "")
 TRAIN_ENV["PYTHONUNBUFFERED"] = "1"
+print(f"OK — environment ready | RL_DIR={RL_DIR}")
 
 
 # ---- Cell 2: smoke check ----------------------------------------------------
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+RL_DIR = Path("/kaggle/working/repo/rl_training_jax")
+if not RL_DIR.exists():
+    raise RuntimeError("Run Cell 1 first — repo not found at /kaggle/working/repo")
+
+TRAIN_ENV = os.environ.copy()
+TRAIN_ENV["PYTHONPATH"] = f"{RL_DIR}/src" + os.pathsep + TRAIN_ENV.get("PYTHONPATH", "")
+TRAIN_ENV["PYTHONUNBUFFERED"] = "1"
+
 os.chdir(RL_DIR)
 subprocess.check_call(
     [sys.executable, "-m", "train_ppo", "--config", "configs/smoke_transformer.yaml"],
@@ -58,8 +78,21 @@ subprocess.check_call(
 
 
 # ---- Cell 3: curriculum training (heuristic -> self-play) -------------------
-# Logs every 5 updates: mode, heuristic win rate, W-L-D, mean_ret, env_sps, losses.
-# Checkpoints every 100 updates under artifacts/jax_ppo_curriculum/.
+# Logs every 5 updates: mode | heur_wr | W-L-D | mean_ret | env_sps | loss ...
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+RL_DIR = Path("/kaggle/working/repo/rl_training_jax")
+if not RL_DIR.exists():
+    raise RuntimeError("Run Cell 1 first — repo not found at /kaggle/working/repo")
+
+TRAIN_ENV = os.environ.copy()
+TRAIN_ENV["PYTHONPATH"] = f"{RL_DIR}/src" + os.pathsep + TRAIN_ENV.get("PYTHONPATH", "")
+TRAIN_ENV["PYTHONUNBUFFERED"] = "1"
+
+os.chdir(RL_DIR)
 subprocess.check_call(
     [sys.executable, "-m", "train_ppo", "--config", "configs/transformer_curriculum.yaml"],
     env=TRAIN_ENV,
@@ -67,9 +100,23 @@ subprocess.check_call(
 
 
 # ---- Cell 4: export submission ----------------------------------------------
-CKPT = RL_DIR / "artifacts" / "jax_ppo_curriculum" / "ckpt_last.npz"
-assert CKPT.exists(), f"checkpoint missing: {CKPT}"
+import os
+import subprocess
+import sys
+from pathlib import Path
 
+RL_DIR = Path("/kaggle/working/repo/rl_training_jax")
+if not RL_DIR.exists():
+    raise RuntimeError("Run Cell 1 first — repo not found at /kaggle/working/repo")
+
+TRAIN_ENV = os.environ.copy()
+TRAIN_ENV["PYTHONPATH"] = f"{RL_DIR}/src" + os.pathsep + TRAIN_ENV.get("PYTHONPATH", "")
+TRAIN_ENV["PYTHONUNBUFFERED"] = "1"
+
+CKPT = RL_DIR / "artifacts" / "jax_ppo_curriculum" / "ckpt_last.npz"
+assert CKPT.exists(), f"checkpoint missing: {CKPT} — run Cell 3 first"
+
+os.chdir(RL_DIR)
 subprocess.check_call(
     [
         sys.executable, "scripts/export_jax_submission.py",

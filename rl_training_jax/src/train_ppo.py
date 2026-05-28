@@ -241,11 +241,11 @@ def learner_record_from_samples(
     log_prob = _gather_by_player(s0["log_prob"], s1["log_prob"], learner_players)
     source_valid = _gather_by_player(s0["source_valid"], s1["source_valid"], learner_players)
     target_has_bucket = _gather_by_player(
-        jnp.any(grid0["bucket_valid"], axis=-1) & grid0["pair_valid"],
-        jnp.any(grid1["bucket_valid"], axis=-1) & grid1["pair_valid"],
+        jnp.any(grid0["full_valid"], axis=-1),
+        jnp.any(grid1["full_valid"], axis=-1),
         learner_players,
     )
-    bucket_valid = _gather_by_player(grid0["bucket_valid"], grid1["bucket_valid"], learner_players)
+    bucket_valid = _gather_by_player(grid0["full_valid"], grid1["full_valid"], learner_players)
 
     reward = jnp.where(
         new_states.done & (learner_players == 0),
@@ -254,6 +254,15 @@ def learner_record_from_samples(
             new_states.done & (learner_players == 1),
             new_states.rewards[:, 1],
             jnp.zeros_like(new_states.rewards[:, 0]),
+        ),
+    )
+    opp_reward = jnp.where(
+        new_states.done & (learner_players == 0),
+        new_states.rewards[:, 1],
+        jnp.where(
+            new_states.done & (learner_players == 1),
+            new_states.rewards[:, 0],
+            jnp.zeros_like(new_states.rewards[:, 1]),
         ),
     )
     return {
@@ -270,6 +279,7 @@ def learner_record_from_samples(
         "bucket_valid": bucket_valid,
         "value": learner_value,
         "reward": reward,
+        "opp_reward": opp_reward,
         "done": new_states.done,
     }
 
@@ -305,11 +315,11 @@ def rollout_step_vs_heuristic_factory(model: PlanetPolicy):
         opp_np = 1 - lp_np
         ha0, hm0, ha1, hm1 = batched_heuristic_actions(states, opp_np, heuristic_agent)
 
-        lp = learner_players.astype(jnp.bool_)
-        final_a0 = jnp.where(lp[:, None, None], a0, ha0)
-        final_a1 = jnp.where(lp[:, None, None], ha1, a1)
-        final_m0 = jnp.where(lp[:, None], m0, hm0)
-        final_m1 = jnp.where(lp[:, None], hm1, m1)
+        is_learner_p0 = (learner_players == 0)
+        final_a0 = jnp.where(is_learner_p0[:, None, None], a0, ha0)
+        final_a1 = jnp.where(is_learner_p0[:, None, None], ha1, a1)
+        final_m0 = jnp.where(is_learner_p0[:, None], m0, hm0)
+        final_m1 = jnp.where(is_learner_p0[:, None], hm1, m1)
 
         new_states = jax.vmap(step_jit)(states, final_a0, final_a1, final_m0, final_m1)
         record = learner_record_from_samples(
@@ -425,8 +435,8 @@ def train(cfg: TrainConfig) -> None:
         flush=True,
     )
     print(
-        "update | mode | heur_wr | W-L-D | episodes | mean_ret | env_sps | "
-        "loss | policy | value | entropy | ev | kl | clip",
+        "update |     mode | lrnr_wr | W-L-D | episodes | mean_ret | env_sps | "
+        "  loss | pol_loss | val_loss | entropy |     ev | approx_kl | clip_fr",
         flush=True,
     )
 
@@ -434,7 +444,7 @@ def train(cfg: TrainConfig) -> None:
     total_env_steps = 0
     finished_returns_window: list[float] = []
     heuristic_returns_window: list[float] = []
-    heur_wins = heur_losses = heur_draws = 0
+    learner_wins = learner_losses = learner_draws = 0
 
     for update_idx in range(1, cfg.total_updates + 1):
         t_rollout = time.perf_counter()
@@ -451,18 +461,20 @@ def train(cfg: TrainConfig) -> None:
             rollout_records.append(rec)
             done_np = np.asarray(rec["done"])
             reward_np = np.asarray(rec["reward"])
+            opp_reward_np = np.asarray(rec.get("opp_reward", np.zeros_like(reward_np)))
             for i in range(cfg.num_envs):
                 if done_np[i]:
                     r = float(reward_np[i])
+                    opp_r = float(opp_reward_np[i])
                     finished_returns_window.append(r)
                     if active_mode == "heuristic":
                         heuristic_returns_window.append(r)
-                        if r > 0:
-                            heur_wins += 1
-                        elif r < 0:
-                            heur_losses += 1
+                        if r > opp_r:
+                            learner_wins += 1
+                        elif r < opp_r:
+                            learner_losses += 1
                         else:
-                            heur_draws += 1
+                            learner_draws += 1
             if done_np.any():
                 states, next_seed, new_lp = reset_done_envs(states, done_np, next_seed, cfg)
                 lp_np = np.asarray(learner_players)
@@ -554,13 +566,13 @@ def train(cfg: TrainConfig) -> None:
         episodes = len(finished_returns_window)
 
         window = heuristic_returns_window[-cfg.heuristic_window_episodes :]
-        heur_wr = float(np.mean([1.0 if r > 0 else 0.0 for r in window])) if window else float("nan")
-        wld = f"{heur_wins}-{heur_losses}-{heur_draws}"
+        learner_wr = float(np.mean([1.0 if r > 0 else 0.0 for r in window])) if window else float("nan")
+        wld = f"{learner_wins}-{learner_losses}-{learner_draws}"
 
         if update_idx % cfg.log_every == 0:
             print(
                 f"{update_idx:6d} | {active_mode:8s} | "
-                f"{heur_wr if active_mode == 'heuristic' else float('nan'):7.1%} | "
+                f"{learner_wr if active_mode == 'heuristic' else float('nan'):7.1%} | "
                 f"{wld if active_mode == 'heuristic' else 'n/a':>5s} | "
                 f"{episodes:7d} | {mean_ret:+.3f} | {env_sps:7.0f} | "
                 f"{metrics_accum['loss']:.4f} | {metrics_accum['policy_loss']:+.4f} | "
@@ -568,20 +580,21 @@ def train(cfg: TrainConfig) -> None:
                 f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f}",
                 flush=True,
             )
+            learner_wins = learner_losses = learner_draws = 0
 
         if (
             opponent_mode == "curriculum"
             and active_mode == "heuristic"
             and not curriculum_switched
             and len(window) >= cfg.heuristic_window_episodes
-            and heur_wr >= cfg.heuristic_win_rate
+            and learner_wr >= cfg.heuristic_win_rate
         ):
             active_mode = "selfplay"
             curriculum_switched = True
             print("=" * 72, flush=True)
             print(
                 f"CURRICULUM SWITCH at update {update_idx}: "
-                f"heuristic win rate {heur_wr:.1%} >= {cfg.heuristic_win_rate:.1%}. "
+                f"heuristic win rate {learner_wr:.1%} >= {cfg.heuristic_win_rate:.1%}. "
                 f"Continuing with self-play for remaining updates.",
                 flush=True,
             )

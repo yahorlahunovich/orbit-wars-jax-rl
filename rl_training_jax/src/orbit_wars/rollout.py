@@ -74,11 +74,11 @@ def sample_actions(
         target_valid_any (B, P) bool          at least one valid target for this source
     """
     pair_valid = action_grid["pair_valid"]          # (B, P, P)
-    bucket_valid = action_grid["bucket_valid"]       # (B, P, P, BUCKETS)
+    full_valid = action_grid["full_valid"]           # (B, P, P, BUCKETS)
     source_owned = action_grid["source_valid"]       # (B, P)
 
     # A target is choosable if any bucket is legal for that (source, target).
-    target_has_bucket = jnp.any(bucket_valid, axis=-1) & pair_valid     # (B, P, P)
+    target_has_bucket = jnp.any(full_valid, axis=-1)     # (B, P, P)
     target_valid_any = jnp.any(target_has_bucket, axis=-1)              # (B, P)
     source_valid = source_owned & target_valid_any                      # (B, P)
 
@@ -105,9 +105,9 @@ def sample_actions(
     tgt_lp = jnp.where(source_valid, tgt_lp, jnp.float32(0.0))
 
     # Bucket distribution conditional on the chosen target.
-    # Gather bucket_valid[b, s, target_idx[b, s], :] -> (B, P, BUCKETS)
+    # Gather full_valid[b, s, target_idx[b, s], :] -> (B, P, BUCKETS)
     chosen_bucket_valid = jnp.take_along_axis(
-        bucket_valid, target_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
+        full_valid, target_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
     ).squeeze(2)                                                # (B, P, BUCKETS)
     bucket_lp_row = _masked_log_softmax(bucket_logits, chosen_bucket_valid)
     entropy_bucket = _entropy_from_log_probs(bucket_lp_row, chosen_bucket_valid)
