@@ -91,6 +91,7 @@ class TrainConfig:
     lr_start: float = 1e-3
     lr_end: float = 1e-5
     max_grad_norm: float = 0.5
+    weight_decay: float = 0.0
 
     # Logging / checkpoint
     log_every: int = 1
@@ -134,6 +135,7 @@ def load_config(path: str | Path) -> TrainConfig:
         lr_start=float(ppo.get("lr_start", 1e-3)),
         lr_end=float(ppo.get("lr_end", 1e-5)),
         max_grad_norm=float(ppo.get("max_grad_norm", 0.5)),
+        weight_decay=float(ppo.get("weight_decay", 0.0)),
         log_every=int(data.get("log_every", 1)),
         checkpoint_every=int(data.get("checkpoint_every", 50)),
         opponent=str(training.get("opponent", "selfplay")),
@@ -362,7 +364,7 @@ def make_optimizer(cfg: TrainConfig):
         decay_steps=cfg.total_updates,
         alpha=cfg.lr_end / max(cfg.lr_start, 1e-12),
     )
-    return optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adam(schedule)), schedule
+    return optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adamw(schedule, weight_decay=cfg.weight_decay)), schedule
 
 
 def init_policy_params(rng, model: PlanetPolicy):
