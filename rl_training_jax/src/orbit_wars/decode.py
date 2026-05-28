@@ -155,6 +155,9 @@ def launch_angle(
 def compose_action_grid(
     state: OrbitWarsState,
     player: jnp.int32 | int,
+    *,
+    intercept_iterations: int = INTERCEPT_ITERATIONS,
+    enable_planet_block: bool = True,
 ) -> dict[str, jnp.ndarray]:
     """Pre-compute everything the policy/rollout needs about every
     (source, target, bucket) triple in a single state.
@@ -210,7 +213,7 @@ def compose_action_grid(
 
     _raw_angle, aim_x, aim_y = estimate_intercept_angles(
         src_x_b, src_y_b, tgt_x_b, tgt_y_b, tgt_orb_b, ship_counts,
-        state.angular_velocity, state.ship_speed, n_iter=INTERCEPT_ITERATIONS,
+        state.angular_velocity, state.ship_speed, n_iter=intercept_iterations,
     )
 
     center_x = jnp.broadcast_to(x[:, None, None], (p_count, p_count, bucket_axis))
@@ -223,9 +226,12 @@ def compose_action_grid(
     start_y = center_y + jnp.sin(angle) * (src_radius_b + LAUNCH_OFFSET_PADDING)
     # Mask when centre→aim crosses the sun (matches heuristic pre-filter).
     sun_blocks = path_crosses_sun(center_x, center_y, aim_x, aim_y, margin=SUN_PATH_MARGIN)
-    planet_blocks = path_blocked_by_planets(
-        center_x, center_y, aim_x, aim_y, x, y, radius, active, margin=PATH_PLANET_MARGIN,
-    )
+    if enable_planet_block:
+        planet_blocks = path_blocked_by_planets(
+            center_x, center_y, aim_x, aim_y, x, y, radius, active, margin=PATH_PLANET_MARGIN,
+        )
+    else:
+        planet_blocks = jnp.zeros_like(sun_blocks, dtype=jnp.bool_)
 
     self_target = jnp.eye(planets.shape[0], dtype=jnp.bool_)
     target_valid_pair = target_valid[None, :] & (~self_target)

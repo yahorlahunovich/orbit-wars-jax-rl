@@ -9,6 +9,8 @@ env:
   num_envs: 512
   episode_steps: 500
   rollout_steps: 32
+  intercept_iterations: 6    # reduce intercept iterations for faster grid build
+  enable_planet_block: false # skip planet-block checks for speed
 
 model:
   d_model: 96
