@@ -415,29 +415,35 @@ def train(cfg: TrainConfig) -> None:
     active_mode = "heuristic" if opponent_mode in ("heuristic", "curriculum") else "selfplay"
     curriculum_switched = False
 
+    save_dir = Path(cfg.save_dir) / cfg.run_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_file_path = save_dir / "training.log"
+    log_file = log_file_path.open("a", encoding="utf-8")
+
+    def log_print(msg: str) -> None:
+        print(msg, flush=True)
+        log_file.write(msg + "\n")
+        log_file.flush()
+
     heuristic_agent = None
     if active_mode == "heuristic":
         heur_path = Path(cfg.heuristic_path) if cfg.heuristic_path else None
         heuristic_agent = load_heuristic_agent(heur_path)
-        print(f"Heuristic opponent loaded from {heur_path or 'default'}", flush=True)
-
-    save_dir = Path(cfg.save_dir) / cfg.run_name
-    save_dir.mkdir(parents=True, exist_ok=True)
+        log_print(f"Heuristic opponent loaded from {heur_path or 'default'}")
 
     seed_base = cfg.seed * 10000 + 1
     states, learner_players_np = make_initial_states(cfg, seed_base)
     learner_players = jnp.asarray(learner_players_np)
     next_seed = seed_base + cfg.num_envs
 
-    print(
+    log_print(
         f"JAX devices: {jax.devices()} | envs={cfg.num_envs} rollout={cfg.rollout_steps} "
-        f"updates={cfg.total_updates} opponent={opponent_mode} active={active_mode}",
-        flush=True,
+        f"updates={cfg.total_updates} opponent={opponent_mode} active={active_mode}"
     )
-    print(
+    log_print(
         "update |     mode | lrnr_wr | W-L-D | episodes | mean_ret | env_sps | "
-        "  loss | pol_loss | val_loss | entropy |     ev | approx_kl | clip_fr",
-        flush=True,
+        "  loss | pol_loss | val_loss | entropy |     ev | approx_kl | clip_fr"
     )
 
     t_start = time.perf_counter()
@@ -570,15 +576,14 @@ def train(cfg: TrainConfig) -> None:
         wld = f"{learner_wins}-{learner_losses}-{learner_draws}"
 
         if update_idx % cfg.log_every == 0:
-            print(
+            log_print(
                 f"{update_idx:6d} | {active_mode:8s} | "
                 f"{learner_wr if active_mode == 'heuristic' else float('nan'):7.1%} | "
                 f"{wld if active_mode == 'heuristic' else 'n/a':>5s} | "
                 f"{episodes:7d} | {mean_ret:+.3f} | {env_sps:7.0f} | "
                 f"{metrics_accum['loss']:.4f} | {metrics_accum['policy_loss']:+.4f} | "
                 f"{metrics_accum['value_loss']:.4f} | {metrics_accum['entropy']:.3f} | "
-                f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f}",
-                flush=True,
+                f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f}"
             )
             learner_wins = learner_losses = learner_draws = 0
 
@@ -591,14 +596,13 @@ def train(cfg: TrainConfig) -> None:
         ):
             active_mode = "selfplay"
             curriculum_switched = True
-            print("=" * 72, flush=True)
-            print(
+            log_print("=" * 72)
+            log_print(
                 f"CURRICULUM SWITCH at update {update_idx}: "
                 f"heuristic win rate {learner_wr:.1%} >= {cfg.heuristic_win_rate:.1%}. "
-                f"Continuing with self-play for remaining updates.",
-                flush=True,
+                f"Continuing with self-play for remaining updates."
             )
-            print("=" * 72, flush=True)
+            log_print("=" * 72)
 
         if update_idx % cfg.checkpoint_every == 0 or update_idx == cfg.total_updates:
             blob = np.frombuffer(flax.serialization.to_bytes(params), dtype=np.uint8)
@@ -606,7 +610,7 @@ def train(cfg: TrainConfig) -> None:
             np.savez(save_dir / f"ckpt_{update_idx:06d}.npz", update=update_idx, params=blob)
 
     total_elapsed = time.perf_counter() - t_start
-    print(f"Done. total_env_steps={total_env_steps} elapsed={total_elapsed:.1f}s", flush=True)
+    log_print(f"Done. total_env_steps={total_env_steps} elapsed={total_elapsed:.1f}s")
 
 
 def main() -> None:
