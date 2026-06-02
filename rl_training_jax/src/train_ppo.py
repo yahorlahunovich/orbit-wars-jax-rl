@@ -461,9 +461,14 @@ def reset_done_envs(states: OrbitWarsState, dones_np: np.ndarray, next_seed: int
 
 
 def make_optimizer(cfg: TrainConfig):
+    # Total optimizer steps = total_updates * epochs * ceil(n_rows / minibatch_size)
+    n_rows = cfg.num_envs * cfg.rollout_steps
+    steps_per_epoch = (n_rows + cfg.minibatch_size - 1) // cfg.minibatch_size
+    total_steps = cfg.total_updates * cfg.epochs * steps_per_epoch
+
     schedule = optax.cosine_decay_schedule(
         init_value=cfg.lr_start,
-        decay_steps=cfg.total_updates,
+        decay_steps=total_steps,
         alpha=cfg.lr_end / max(cfg.lr_start, 1e-12),
     )
     return optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adamw(schedule, weight_decay=cfg.weight_decay)), schedule
