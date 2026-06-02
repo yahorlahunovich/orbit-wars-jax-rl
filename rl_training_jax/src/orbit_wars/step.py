@@ -475,9 +475,16 @@ def _termination(state: OrbitWarsState) -> OrbitWarsState:
     scores = planet_score + fleet_score                          # (NUM_PLAYERS,)
 
     max_score = jnp.max(scores)
+    all_max = jnp.all(scores == max_score)
+    
+    # Reward: 1.0 for strictly winning, -1.0 for strictly losing, 0.0 for ties.
     rewards = jnp.where(
         terminated,
-        jnp.where((scores == max_score) & (max_score > 0.0), 1.0, -1.0),
+        jnp.where(
+            all_max | (max_score <= 0.0),
+            jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32),
+            jnp.where(scores == max_score, 1.0, -1.0)
+        ),
         jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32),
     )
     return state.replace(done=terminated, rewards=rewards)
