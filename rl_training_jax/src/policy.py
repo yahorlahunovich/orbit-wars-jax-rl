@@ -85,6 +85,7 @@ class PlanetPolicy(nn.Module):
     num_heads: int = 4
     num_layers: int = 3
     ff_mult: int = 4
+    noop_bias_init: float = 2.0  # Initial logit bias for self-target (NOOP)
 
     def setup(self) -> None:
         self.planet_in = nn.Dense(self.d_model)
@@ -99,6 +100,9 @@ class PlanetPolicy(nn.Module):
         )
         self.value_head = nn.Sequential(
             [nn.Dense(self.d_model), nn.gelu, nn.Dense(1)]
+        )
+        self.noop_bias = self.param(
+            "noop_bias", nn.initializers.constant(self.noop_bias_init), ()
         )
 
     def __call__(
@@ -125,6 +129,10 @@ class PlanetPolicy(nn.Module):
         k = self.target_proj_k(planet_h)                     # (B, P, d)
         scale = jnp.float32(1.0 / jnp.sqrt(self.d_model))
         target_logits = jnp.einsum("bsd,btd->bst", q, k) * scale     # (B, P, P)
+
+        # Add learnable NOOP bias to the diagonal (self-target)
+        diag_mask = jnp.eye(p, dtype=target_logits.dtype)            # (P, P)
+        target_logits = target_logits + diag_mask[None, :, :] * self.noop_bias
 
         # Bucket head: per source planet.
         bucket_logits = self.bucket_head(planet_h)           # (B, P, BUCKETS)

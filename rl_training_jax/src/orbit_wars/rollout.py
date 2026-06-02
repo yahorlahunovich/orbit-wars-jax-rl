@@ -166,11 +166,18 @@ def pack_padded_actions(
 
     # Build the per-source row.
     rows = jnp.stack([from_ids, angle, ships], axis=-1)         # (B, P, 3)
-    mask = source_valid.astype(jnp.float32)                     # (B, P)
+
+    # Identify NOOP moves (target == source)
+    is_noop = (target_idx == s_range[None, :])                  # (B, P)
+
+    # Mask is true only for valid sources that are NOT noops.
+    # We zero out the action for NOOPs so no ships are launched.
+    env_mask = source_valid & (~is_noop)
+    mask = env_mask.astype(jnp.float32)                         # (B, P)
     rows = rows * mask[..., None]
 
     # Compact sources so all valid ones are first. We sort by NEGATIVE mask
-    # (valid sources have key=-1 → sort first), then truncate.
+    # (valid sources have key=-1 -> sort first), then truncate.
     sort_key = (-mask).astype(jnp.float32)
     sort_idx = jnp.argsort(sort_key, axis=-1)                   # (B, P)
     rows_sorted = jnp.take_along_axis(rows, sort_idx[..., None].repeat(3, axis=-1), axis=1)

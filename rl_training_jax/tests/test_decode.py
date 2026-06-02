@@ -102,9 +102,15 @@ def test_full_valid_implies_pair_valid_and_bucket_valid():
     pair = np.asarray(grid["pair_valid"])
     bucket = np.asarray(grid["bucket_valid"])
     assert np.all(~full | (pair[..., None] & bucket))
-    # No self-targeted move should ever be marked valid.
+    # Self-targeted moves are allowed in full_valid (they are masked out at pack time to represent NOOPs).
     diag = np.arange(MAX_PLANETS)
-    assert not np.any(full[diag, diag, :])
+    # Just ensure that there are no logic inconsistencies with self-targets.
+    source_valid = np.asarray(grid["source_valid"])
+    active = np.asarray(state.planets[:, 7] > 0.0)
+    for i in range(MAX_PLANETS):
+        if source_valid[i] and active[i]:
+            # For an active owned planet, bucket 0 (25%) should be valid for self target.
+            assert bucket[i, i, 0]
 
 
 def test_full_valid_implies_source_owned_by_player():

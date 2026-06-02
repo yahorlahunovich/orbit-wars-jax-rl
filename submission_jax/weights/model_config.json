@@ -3,7 +3,5 @@
   "num_heads": 4,
   "num_layers": 2,
   "bucket_count": 8,
-  "planet_feature_dim": 31,
-  "fleet_feature_dim": 15,
-  "global_feature_dim": 22
+  "planet_feature_dim": 55
 }

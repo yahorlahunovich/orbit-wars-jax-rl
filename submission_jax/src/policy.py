@@ -9,11 +9,11 @@ Consumes the per-entity feature dict produced by
 
 Design (kept small for Kaggle GPU inference):
 
-    tokens = [global_token, planet_tokens, fleet_tokens]
+    tokens = [planet_tokens]
     tokens = TransformerEncoder(d_model, n_heads, n_layers)(tokens, mask)
     target_logits = einsum("bsd, btd -> bst", planet_h, planet_h) / sqrt(d_model)
     bucket_logits = MLP(planet_h)
-    value         = MLP(global_h)
+    value         = MLP(mean(planet_h))
 
 Masks are applied:
 
@@ -76,10 +76,10 @@ class TransformerBlock(nn.Module):
 
 
 class PlanetPolicy(nn.Module):
-    """Transformer over (global, planets, fleets) producing planet-action heads."""
+    """Transformer over (planets) producing planet-action heads."""
 
     planet_count: int
-    fleet_count: int
+    fleet_count: int  # Unused but kept for API compatibility with train_ppo setup
     bucket_count: int = 8
     d_model: int = 96
     num_heads: int = 4
@@ -87,11 +87,7 @@ class PlanetPolicy(nn.Module):
     ff_mult: int = 4
 
     def setup(self) -> None:
-        # Token-type embedding: 0 = global, 1 = planet, 2 = fleet.
-        self.type_emb = nn.Embed(3, self.d_model)
         self.planet_in = nn.Dense(self.d_model)
-        self.fleet_in = nn.Dense(self.d_model)
-        self.global_in = nn.Dense(self.d_model)
         self.blocks = [
             TransformerBlock(self.d_model, self.num_heads, self.ff_mult)
             for _ in range(self.num_layers)
@@ -109,44 +105,18 @@ class PlanetPolicy(nn.Module):
         self,
         planet_features: jnp.ndarray,    # (B, P, F_p)
         planet_mask: jnp.ndarray,        # (B, P) bool
-        fleet_features: jnp.ndarray,     # (B, F, F_f)
-        fleet_mask: jnp.ndarray,         # (B, F) bool
-        global_features: jnp.ndarray,    # (B, F_g)
     ) -> PolicyOutput:
         b, p, _ = planet_features.shape
-        f = fleet_features.shape[1]
 
         planet_tok = self.planet_in(planet_features)         # (B, P, d)
-        fleet_tok = self.fleet_in(fleet_features)            # (B, F, d)
-        global_tok = self.global_in(global_features)         # (B, d)
-        global_tok = global_tok[:, None, :]                  # (B, 1, d)
 
-        type_idx = jnp.concatenate(
-            [
-                jnp.zeros((1,), dtype=jnp.int32),
-                jnp.ones((p,), dtype=jnp.int32),
-                jnp.full((f,), 2, dtype=jnp.int32),
-            ],
-            axis=0,
-        )                                                    # (1+P+F,)
-        type_vecs = self.type_emb(type_idx)                  # (1+P+F, d)
-
-        tokens = jnp.concatenate([global_tok, planet_tok, fleet_tok], axis=1)   # (B, 1+P+F, d)
-        tokens = tokens + type_vecs[None, :, :]
-        full_mask = jnp.concatenate(
-            [
-                jnp.ones((b, 1), dtype=jnp.bool_),
-                planet_mask,
-                fleet_mask,
-            ],
-            axis=-1,
-        )                                                    # (B, 1+P+F)
+        tokens = planet_tok
+        full_mask = planet_mask                              # (B, P)
 
         for block in self.blocks:
             tokens = block(tokens, full_mask)
 
-        global_h = tokens[:, 0, :]                           # (B, d)
-        planet_h = tokens[:, 1 : 1 + p, :]                   # (B, P, d)
+        planet_h = tokens                                    # (B, P, d)
 
         # Target head: for each source planet, score every target planet via
         # scaled dot-product. Separate Q/K projections so source and target
@@ -159,8 +129,10 @@ class PlanetPolicy(nn.Module):
         # Bucket head: per source planet.
         bucket_logits = self.bucket_head(planet_h)           # (B, P, BUCKETS)
 
-        # Value head from the global token.
-        value = self.value_head(global_h).squeeze(-1)        # (B,)
+        # Value head from mean pooling over valid planets.
+        valid_count = jnp.maximum(jnp.sum(planet_mask, axis=1, keepdims=True), 1.0)
+        mean_h = jnp.sum(planet_h, axis=1) / valid_count     # (B, d)
+        value = self.value_head(mean_h).squeeze(-1)          # (B,)
 
         return PolicyOutput(
             target_logits=target_logits,

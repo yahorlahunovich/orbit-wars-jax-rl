@@ -20,7 +20,7 @@ model:
   bucket_count: 8
 
 training:
-  opponent: curriculum          # selfplay | heuristic | curriculum
+  opponent: selfplay          # selfplay | heuristic | curriculum
   heuristic_win_rate: 0.35      # switch to self-play when rolling win rate >= this
   heuristic_window_episodes: 80 # episodes in rolling window for switch decision
   heuristic_path: versions/lb_highest_1000_search_value/main.py

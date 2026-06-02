@@ -218,18 +218,18 @@ def test_path_blocked_by_middle_planet():
     pr = jnp.array([3.0, 3.0, br, 0.0], dtype=jnp.float32)
     active = jnp.array([True, True, True, False], dtype=jnp.bool_)
 
-    start_x = jnp.full((p, p, 1), sx, dtype=jnp.float32)
-    start_y = jnp.full((p, p, 1), sy, dtype=jnp.float32)
-    aim_x = px[None, :, None]
-    aim_y = py[None, :, None]
+    start_x = jnp.full((p, p), sx, dtype=jnp.float32)
+    start_y = jnp.full((p, p), sy, dtype=jnp.float32)
+    aim_x = px[None, :]
+    aim_y = py[None, :]
 
     blocked = np.asarray(path_blocked_by_planets(
         start_x, start_y, aim_x, aim_y, px, py, pr, active, margin=0.5,
     ))
     # src=0, tgt=1: blocker slot 2 is in the way.
-    assert blocked[0, 1, 0]
+    assert blocked[0, 1]
     # src=0, tgt=2: no third planet between.
-    assert not blocked[0, 2, 0]
+    assert not blocked[0, 2]
 
 
 def test_segment_clear_of_circles_vectorized():

@@ -209,22 +209,42 @@ def _gather_by_player(zero_t, one_t, learner_players: jnp.ndarray):
 
 
 def sample_both_players_factory(model: PlanetPolicy, grid_fn):
-    """Sample policy actions for both seats (same params, independent RNG)."""
+    """Sample policy actions for both seats. Uses params for learner, opp_params for opponent."""
 
     @jax.jit
-    def sample(states: OrbitWarsState, params, rng):
+    def sample(states: OrbitWarsState, params, opp_params, rng, learner_players):
         rng, k0, k1 = jax.random.split(rng, 3)
+        
         feats0 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(0))
-        out0 = model.apply(params, **feats0)
+        feats1 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(1))
+        
+        def _gather_feats(f0, f1, is_p0):
+            # Expands the (B,) mask to the shape of f0/f1 for jnp.where
+            mask = is_p0
+            for _ in range(f0.ndim - 1):
+                mask = mask[..., None]
+            return jnp.where(mask, f0, f1)
+
+        is_learner_p0 = (learner_players == 0)
+        is_opp_p0 = (learner_players == 1)
+
+        feats_learner = jax.tree_util.tree_map(lambda f0, f1: _gather_feats(f0, f1, is_learner_p0), feats0, feats1)
+        feats_opp = jax.tree_util.tree_map(lambda f0, f1: _gather_feats(f0, f1, is_opp_p0), feats0, feats1)
+
+        out_learner = model.apply(params, **feats_learner)
+        out_opp = model.apply(opp_params, **feats_opp)
+
+        out0 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_learner_p0), out_learner, out_opp)
+        out1 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_opp_p0), out_learner, out_opp)
+
         grid0 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(0))
         s0 = sample_actions(k0, out0.target_logits, out0.bucket_logits, grid0)
         a0, m0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
 
-        feats1 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(1))
-        out1 = model.apply(params, **feats1)
         grid1 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(1))
         s1 = sample_actions(k1, out1.target_logits, out1.bucket_logits, grid1)
         a1, m1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
+        
         return (a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, rng)
 
     return sample
@@ -351,15 +371,34 @@ def rollout_step_selfplay_factory(model: PlanetPolicy, grid_fn):
     step_jit = __import__("orbit_wars.step", fromlist=["step_jit"]).step_jit
 
     @jax.jit
-    def step_one(states: OrbitWarsState, params, rng, learner_players):
-        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, rng = sample(
-            states, params, rng,
+    def step_one(states: OrbitWarsState, params, opp_params, rng, learner_players, reset_pool):
+        rng, k_sample, k_pool, k_lp = jax.random.split(rng, 4)
+        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, k_sample = sample(
+            states, params, opp_params, k_sample, learner_players
         )
         new_states = jax.vmap(step_jit)(states, a0, a1, m0, m1)
         record = learner_record_from_samples(
             learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, new_states,
         )
-        return new_states, record, rng
+        
+        dones = new_states.done
+        
+        # Auto-reset
+        pool_size = reset_pool.step.shape[0]
+        pool_indices = jax.random.randint(k_pool, (states.step.shape[0],), 0, pool_size)
+        fresh_states = jax.tree_util.tree_map(lambda p: p[pool_indices], reset_pool)
+        
+        next_states = jax.tree_util.tree_map(
+            lambda new_s, fresh_s: jnp.where(
+                dones[(...,) + (None,) * (new_s.ndim - 1)], fresh_s, new_s
+            ),
+            new_states, fresh_states
+        )
+        
+        new_learner_players = jax.random.randint(k_lp, (states.step.shape[0],), 0, 2)
+        next_learner_players = jnp.where(dones, new_learner_players, learner_players)
+        
+        return next_states, record, rng, next_learner_players
 
     return step_one
 
@@ -462,6 +501,7 @@ def train(cfg: TrainConfig) -> None:
         bucket_count=cfg.bucket_count,
     )
     params, _ = init_policy_params(init_rng, model)
+    opp_params = params
     optimizer, _ = make_optimizer(cfg)
     opt_state = optimizer.init(params)
 
@@ -498,6 +538,15 @@ def train(cfg: TrainConfig) -> None:
         heuristic_agent = load_heuristic_agent(heur_path)
         log_print(f"Heuristic opponent loaded from {heur_path or 'default'}")
 
+    # Pre-generate reset pool for auto-reset
+    pool_size = max(256, cfg.num_envs * 4)
+    log_print(f"Generating reset pool of size {pool_size}...")
+    reset_pool_states, _ = make_initial_states(cfg, cfg.seed + 100000)
+    # We need a pool of `pool_size`. make_initial_states uses `num_envs` so we just call it with a custom config.
+    import dataclasses
+    cfg_pool = dataclasses.replace(cfg, num_envs=pool_size)
+    reset_pool, _ = make_initial_states(cfg_pool, cfg.seed + 100000)
+    
     seed_base = cfg.seed * 10000 + 1
     states, learner_players_np = make_initial_states(cfg, seed_base)
     learner_players = jnp.asarray(learner_players_np)
@@ -522,21 +571,23 @@ def train(cfg: TrainConfig) -> None:
         t_rollout = time.perf_counter()
         rollout_records = []
         for _ in range(cfg.rollout_steps):
-            states = maybe_spawn_comets_host(states, cfg)
+            if active_mode != "selfplay":
+                states = maybe_spawn_comets_host(states, cfg)
             rng, sub = jax.random.split(rng)
             if active_mode == "selfplay":
-                states, rec, rng = rollout_selfplay(states, params, sub, learner_players)
+                states, rec, rng, learner_players = rollout_selfplay(states, params, opp_params, sub, learner_players, reset_pool)
             else:
                 opp_np = 1 - learner_players_np
                 states, rec, rng = rollout_vs_heuristic(
                     states, params, sub, learner_players, opp_np, heuristic_agent,
                 )
             rollout_records.append(rec)
-            done_np = np.asarray(rec["done"])
-            if done_np.any():
-                reward_np = np.asarray(rec["reward"])
-                finished_returns_window.extend(reward_np[done_np].tolist())
-                if active_mode == "heuristic":
+            
+            if active_mode != "selfplay":
+                done_np = np.asarray(rec["done"])
+                if done_np.any():
+                    reward_np = np.asarray(rec["reward"])
+                    finished_returns_window.extend(reward_np[done_np].tolist())
                     opp_reward_np = np.asarray(rec.get("opp_reward", np.zeros_like(reward_np)))
                     heuristic_returns_window.extend(reward_np[done_np].tolist())
                     wins = np.sum((reward_np > opp_reward_np) & done_np)
@@ -545,10 +596,29 @@ def train(cfg: TrainConfig) -> None:
                     learner_wins += int(wins)
                     learner_losses += int(losses)
                     learner_draws += int(draws)
+    
+                    states, next_seed, new_lp = reset_done_envs(states, done_np, next_seed, cfg)
+                    learner_players_np = np.where(done_np, new_lp, learner_players_np)
+                    learner_players = jnp.asarray(learner_players_np)
 
-                states, next_seed, new_lp = reset_done_envs(states, done_np, next_seed, cfg)
-                learner_players_np = np.where(done_np, new_lp, learner_players_np)
-                learner_players = jnp.asarray(learner_players_np)
+        # For selfplay, process dones after the rollout loop to avoid blocking GPU
+        if active_mode == "selfplay":
+            # Just extract the data once it's all done
+            dones_batch = jnp.stack([r["done"] for r in rollout_records], axis=1)
+            rewards_batch = jnp.stack([r["reward"] for r in rollout_records], axis=1)
+            opp_rewards_batch = jnp.stack([r["opp_reward"] for r in rollout_records], axis=1)
+            done_mask = np.asarray(dones_batch)
+            reward_vals = np.asarray(rewards_batch)
+            opp_reward_vals = np.asarray(opp_rewards_batch)
+            if done_mask.any():
+                finished_returns_window.extend(reward_vals[done_mask].tolist())
+                heuristic_returns_window.extend(reward_vals[done_mask].tolist())
+                wins = np.sum((reward_vals > opp_reward_vals) & done_mask)
+                losses = np.sum((reward_vals < opp_reward_vals) & done_mask)
+                draws = np.sum((reward_vals == opp_reward_vals) & done_mask)
+                learner_wins += int(wins)
+                learner_losses += int(losses)
+                learner_draws += int(draws)
 
         rollout_s = time.perf_counter() - t_rollout
         total_env_steps += cfg.rollout_steps * cfg.num_envs
@@ -637,14 +707,19 @@ def train(cfg: TrainConfig) -> None:
         if update_idx % cfg.log_every == 0:
             log_print(
                 f"{update_idx:6d} | {active_mode:8s} | "
-                f"{learner_wr if active_mode == 'heuristic' else float('nan'):7.1%} | "
-                f"{wld if active_mode == 'heuristic' else 'n/a':>5s} | "
+                f"{learner_wr:7.1%} | "
+                f"{wld:>5s} | "
                 f"{episodes:7d} | {mean_ret:+.3f} | {env_sps:7.0f} | "
                 f"{metrics_accum['loss']:.4f} | {metrics_accum['policy_loss']:+.4f} | "
                 f"{metrics_accum['value_loss']:.4f} | {metrics_accum['entropy']:.3f} | "
                 f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f}"
             )
             learner_wins = learner_losses = learner_draws = 0
+
+        if active_mode == "selfplay" and len(window) >= cfg.heuristic_window_episodes and learner_wr >= 0.54:
+            log_print(f"Update {update_idx}: Self-play winrate {learner_wr:.1%} >= 54.0%. Updating opponent parameters.")
+            opp_params = params
+            heuristic_returns_window.clear()
 
         if (
             opponent_mode == "curriculum"

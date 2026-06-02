@@ -32,7 +32,7 @@ from .constants import (
 from .geometry import fleet_speed
 from .state import OrbitWarsState
 
-PLANET_FEATURE_DIM = 31
+PLANET_FEATURE_DIM = 55
 FLEET_FEATURE_DIM = 15
 GLOBAL_FEATURE_DIM = 22
 
@@ -71,22 +71,18 @@ def _is_orbiting_per_planet(state: OrbitWarsState) -> jnp.ndarray:
     return orbit_r + radius < ROTATION_RADIUS_LIMIT
 
 
-def _fleet_incoming_to_planet(state: OrbitWarsState) -> jnp.ndarray:
-    """Return (F, P) bool matrix: True if fleet f is heading toward planet p.
-
-    Heuristic: project (planet - fleet) onto the fleet's heading direction.
-    Considered "incoming" iff the projection is positive (fleet is moving
-    toward the planet) AND the perpendicular distance is within the planet's
-    radius + a small tolerance (so we count fleets on a near-collision path).
-    """
+def _fleet_projections(state: OrbitWarsState, player_f: jnp.float32) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Calculate exact destination and ETA for all fleets using physics."""
     planets = state.planets
     fleets = state.fleets
-
+    
     fx = fleets[:, 2]
     fy = fleets[:, 3]
     angle = fleets[:, 4]
     cos_a = jnp.cos(angle)
     sin_a = jnp.sin(angle)
+    fleet_ships = fleets[:, 6]
+    speed = fleet_speed(fleet_ships, state.ship_speed)
     fleet_active = fleets[:, 7] > 0.0
 
     px = planets[:, 2]
@@ -95,13 +91,54 @@ def _fleet_incoming_to_planet(state: OrbitWarsState) -> jnp.ndarray:
     planet_active = planets[:, 7] > 0.0
 
     dx = px[None, :] - fx[:, None]     # (F, P)
-    dy = py[None, :] - fy[:, None]
-    proj = dx * cos_a[:, None] + dy * sin_a[:, None]            # along heading
-    perp = jnp.abs(-dx * sin_a[:, None] + dy * cos_a[:, None])  # perpendicular
-    near_path = (perp < (radius[None, :] + INCOMING_PERP_TOL))
-    heading_toward = proj > 0.0
-
-    return heading_toward & near_path & fleet_active[:, None] & planet_active[None, :]
+    dy = py[None, :] - fy[:, None]     # (F, P)
+    
+    ux = cos_a[:, None]
+    uy = sin_a[:, None]
+    
+    dot_ru = dx * ux + dy * uy
+    
+    sp = speed[:, None]
+    sp_safe = jnp.maximum(sp, 1e-6)
+    t_close_raw = dot_ru / sp_safe
+    t_close = jnp.where(dot_ru > 0.0, t_close_raw, 0.0)
+    
+    cx = fx[:, None] + sp * ux * t_close
+    cy = fy[:, None] + sp * uy * t_close
+    
+    d_close = jnp.sqrt((px[None, :] - cx)**2 + (py[None, :] - cy)**2)
+    
+    slop = jnp.float32(3.0)
+    collides = (t_close > 0.0) & (d_close <= radius[None, :] + slop) & planet_active[None, :]
+    
+    big = jnp.float32(1e9)
+    masked_t_close = jnp.where(collides, t_close, big)
+    
+    best_t_close = jnp.min(masked_t_close, axis=1) # (F,)
+    best_p_idx = jnp.argmin(masked_t_close, axis=1) # (F,)
+    
+    has_target = fleet_active & (best_t_close < big)
+    
+    fleet_owner = fleets[:, 1]
+    f_is_me = has_target & (fleet_owner == player_f)
+    f_is_enemy = has_target & (fleet_owner >= 0.0) & (fleet_owner != player_f)
+    
+    incoming_me = jnp.zeros(MAX_PLANETS, dtype=jnp.float32)
+    incoming_me = incoming_me.at[best_p_idx].add(jnp.where(f_is_me, fleet_ships, 0.0))
+    
+    incoming_enemy = jnp.zeros(MAX_PLANETS, dtype=jnp.float32)
+    incoming_enemy = incoming_enemy.at[best_p_idx].add(jnp.where(f_is_enemy, fleet_ships, 0.0))
+    
+    eta_me = jnp.full(MAX_PLANETS, big, dtype=jnp.float32)
+    eta_me = eta_me.at[best_p_idx].min(jnp.where(f_is_me, best_t_close, big))
+    
+    eta_enemy = jnp.full(MAX_PLANETS, big, dtype=jnp.float32)
+    eta_enemy = eta_enemy.at[best_p_idx].min(jnp.where(f_is_enemy, best_t_close, big))
+    
+    eta_me_norm = jnp.minimum(eta_me, 100.0) / 100.0
+    eta_enemy_norm = jnp.minimum(eta_enemy, 100.0) / 100.0
+    
+    return incoming_me, incoming_enemy, eta_me_norm, eta_enemy_norm
 
 
 def _nearest_distance_to_subset(
@@ -186,9 +223,6 @@ def encode_observation(
     Returns a dict with keys:
         planet_features (P, F_PLANET) float32
         planet_mask     (P,)           bool
-        fleet_features  (F, F_FLEET)   float32
-        fleet_mask      (F,)           bool
-        global_features (F_GLOBAL,)    float32
 
     Apply `jax.vmap(encode_observation, in_axes=(0, None))` for batched envs.
     """
@@ -225,15 +259,7 @@ def encode_observation(
     orbit_angle_cos = jnp.where(is_orbiting, jnp.cos(current_angle), 0.0)
     orbit_r_norm = jnp.where(is_orbiting, orbit_r / DIST_DENOM, 0.0)
 
-    # Per-planet incoming ships (split by my / enemy fleets).
-    inc_fp = _fleet_incoming_to_planet(state)                    # (F, P) bool
-    fleet_owner = fleets[:, 1]
-    fleet_ships = fleets[:, 6]
-    fleet_active = fleets[:, 7] > 0.0
-    f_is_me = fleet_active & (fleet_owner == player_f)
-    f_is_enemy = fleet_active & (fleet_owner >= 0.0) & (fleet_owner != player_f)
-    incoming_me = jnp.sum(jnp.where(inc_fp & f_is_me[:, None], fleet_ships[:, None], 0.0), axis=0)
-    incoming_enemy = jnp.sum(jnp.where(inc_fp & f_is_enemy[:, None], fleet_ships[:, None], 0.0), axis=0)
+    incoming_me, incoming_enemy, eta_me_norm, eta_enemy_norm = _fleet_projections(state, player_f)
 
     nearest_enemy_d_raw = _nearest_distance_to_subset(planets, owner_is_enemy)
     nearest_friend_d_raw = _nearest_distance_to_subset(planets, owner_is_me)
@@ -250,10 +276,8 @@ def encode_observation(
     roi_norm = roi / jnp.float32(2.0)
     is_high_value = (production >= 3.0).astype(jnp.float32) * active.astype(jnp.float32)
 
-    # Rankings among active planets.
     ship_rank_all = _rank_norm(ships, active)
     prod_rank_all = _rank_norm(production, active)
-    # "Largest" flags (rank == 1.0 within the owner group, i.e. strictly largest).
     my_ship_rank = _rank_norm(ships, owner_is_me)
     enemy_ship_rank = _rank_norm(ships, owner_is_enemy)
     is_my_largest = owner_is_me & (my_ship_rank >= jnp.float32(1.0 - 1e-6))
@@ -264,8 +288,50 @@ def encode_observation(
     would_lose = active & owner_is_me & (incoming_enemy > ships)
 
     comet_remaining = _comet_remaining_life(state)
-    # MAX_COMET_PATH_LEN = 64 → divide by 64 for a soft [0, 1].
     comet_remaining_norm = comet_remaining / jnp.float32(64.0)
+
+    # Global variables computation
+    my_planet_count = jnp.sum(owner_is_me.astype(jnp.float32))
+    enemy_planet_count = jnp.sum(owner_is_enemy.astype(jnp.float32))
+    neutral_planet_count = jnp.sum(owner_is_neutral.astype(jnp.float32))
+
+    my_prod = jnp.sum(jnp.where(owner_is_me, production, 0.0))
+    enemy_prod = jnp.sum(jnp.where(owner_is_enemy, production, 0.0))
+
+    my_ships = jnp.sum(jnp.where(owner_is_me, ships, 0.0))
+    enemy_ships = jnp.sum(jnp.where(owner_is_enemy, ships, 0.0))
+
+    prod_lead = (my_prod - enemy_prod) / (my_prod + enemy_prod + 1.0)
+    ship_lead = (my_ships - enemy_ships) / (my_ships + enemy_ships + 1.0)
+
+    active_comets = jnp.sum(state.comets.active.astype(jnp.float32))
+
+    fleet_owner = fleets[:, 1]
+    fleet_ships = fleets[:, 6]
+    fleet_active = fleets[:, 7] > 0.0
+    f_is_me = fleet_active & (fleet_owner == player_f)
+    f_is_enemy = fleet_active & (fleet_owner >= 0.0) & (fleet_owner != player_f)
+
+    my_fleet_ships = jnp.sum(jnp.where(f_is_me, fleet_ships, 0.0))
+    enemy_fleet_ships = jnp.sum(jnp.where(f_is_enemy, fleet_ships, 0.0))
+    my_fleet_count = jnp.sum(f_is_me.astype(jnp.float32))
+    enemy_fleet_count = jnp.sum(f_is_enemy.astype(jnp.float32))
+
+    turn = state.step.astype(jnp.float32) / jnp.maximum(state.episode_steps.astype(jnp.float32), 1.0)
+
+    my_largest_ships = jnp.max(jnp.where(owner_is_me, ships, 0.0))
+    enemy_largest_ships = jnp.max(jnp.where(owner_is_enemy, ships, 0.0))
+    my_largest_prod = jnp.max(jnp.where(owner_is_me, production, 0.0))
+    enemy_largest_prod = jnp.max(jnp.where(owner_is_enemy, production, 0.0))
+
+    cur_step = state.step.astype(jnp.float32)
+    ep = jnp.maximum(state.episode_steps.astype(jnp.float32), 1.0)
+    spawn_arr = jnp.asarray(COMET_SPAWN_STEPS, dtype=jnp.float32)
+    delta = spawn_arr - cur_step
+    delta = jnp.where(delta > 0.0, delta, ep)
+    next_comet_in = jnp.min(delta) / ep
+
+    is_late_game = (turn > jnp.float32(0.5)).astype(jnp.float32)
 
     planet_features = jnp.stack(
         [
@@ -288,137 +354,47 @@ def encode_observation(
             orbit_angle_cos,                                         # 16
             _ships_log_norm(incoming_me),                            # 17
             _ships_log_norm(incoming_enemy),                         # 18
-            roi_norm,                                                # 19
-            is_high_value,                                           # 20
-            nearest_enemy_d - nearest_friend_d,                      # 21
-            ship_rank_all,                                           # 22
-            prod_rank_all,                                           # 23
-            net_balance_signed_log,                                  # 24
-            would_lose.astype(jnp.float32),                          # 25
-            time_to_nearest_enemy,                                   # 26
-            time_to_nearest_neutral,                                 # 27
-            is_my_largest.astype(jnp.float32),                       # 28
-            is_enemy_largest.astype(jnp.float32),                    # 29
-            comet_remaining_norm,                                    # 30
+            eta_me_norm,                                             # 19
+            eta_enemy_norm,                                          # 20
+            roi_norm,                                                # 21
+            is_high_value,                                           # 22
+            nearest_enemy_d - nearest_friend_d,                      # 23
+            ship_rank_all,                                           # 24
+            prod_rank_all,                                           # 25
+            net_balance_signed_log,                                  # 26
+            would_lose.astype(jnp.float32),                          # 27
+            time_to_nearest_enemy,                                   # 28
+            time_to_nearest_neutral,                                 # 29
+            is_my_largest.astype(jnp.float32),                       # 30
+            is_enemy_largest.astype(jnp.float32),                    # 31
+            comet_remaining_norm,                                    # 32
+            jnp.broadcast_to(turn, (MAX_PLANETS,)),                                            # 33
+            jnp.broadcast_to(1.0 - turn, (MAX_PLANETS,)),                                      # 34
+            jnp.broadcast_to(my_planet_count / jnp.float32(MAX_PLANETS), (MAX_PLANETS,)),      # 35
+            jnp.broadcast_to(enemy_planet_count / jnp.float32(MAX_PLANETS), (MAX_PLANETS,)),   # 36
+            jnp.broadcast_to(neutral_planet_count / jnp.float32(MAX_PLANETS), (MAX_PLANETS,)), # 37
+            jnp.broadcast_to(my_prod / jnp.float32(50.0), (MAX_PLANETS,)),                     # 38
+            jnp.broadcast_to(enemy_prod / jnp.float32(50.0), (MAX_PLANETS,)),                  # 39
+            jnp.broadcast_to(_ships_log_norm(my_ships), (MAX_PLANETS,)),                       # 40
+            jnp.broadcast_to(_ships_log_norm(enemy_ships), (MAX_PLANETS,)),                    # 41
+            jnp.broadcast_to(prod_lead, (MAX_PLANETS,)),                                       # 42
+            jnp.broadcast_to(ship_lead, (MAX_PLANETS,)),                                       # 43
+            jnp.broadcast_to(active_comets / jnp.float32(MAX_COMET_GROUPS), (MAX_PLANETS,)),   # 44
+            jnp.broadcast_to(_fleet_ships_log_norm(my_fleet_ships), (MAX_PLANETS,)),           # 45
+            jnp.broadcast_to(_fleet_ships_log_norm(enemy_fleet_ships), (MAX_PLANETS,)),        # 46
+            jnp.broadcast_to(my_fleet_count / jnp.float32(MAX_FLEETS), (MAX_PLANETS,)),        # 47
+            jnp.broadcast_to(enemy_fleet_count / jnp.float32(MAX_FLEETS), (MAX_PLANETS,)),     # 48
+            jnp.broadcast_to(_ships_log_norm(my_largest_ships), (MAX_PLANETS,)),               # 49
+            jnp.broadcast_to(_ships_log_norm(enemy_largest_ships), (MAX_PLANETS,)),            # 50
+            jnp.broadcast_to(my_largest_prod / PRODUCTION_DENOM, (MAX_PLANETS,)),              # 51
+            jnp.broadcast_to(enemy_largest_prod / PRODUCTION_DENOM, (MAX_PLANETS,)),           # 52
+            jnp.broadcast_to(next_comet_in, (MAX_PLANETS,)),                                   # 53
+            jnp.broadcast_to(is_late_game, (MAX_PLANETS,)),                                    # 54
         ],
         axis=-1,
-    )                                                                # (P, 31)
+    )
     planet_features = jnp.where(active[:, None], planet_features, 0.0)
     planet_mask = active
-
-    # ---------------- Fleet features --------------------------------------
-    fx = fleets[:, 2]
-    fy = fleets[:, 3]
-    angle = fleets[:, 4]
-    cos_a = jnp.cos(angle)
-    sin_a = jnp.sin(angle)
-    speed = fleet_speed(fleet_ships, state.ship_speed)
-    vx = cos_a * speed
-    vy = sin_a * speed
-
-    # Position relative to the sun. Bearing-radial frame: rotate heading into
-    # the local frame where +x points outward from the sun. Useful for
-    # distinguishing inbound-to-sun (suicidal) fleets from outbound ones.
-    fdx_c = fx - CENTER
-    fdy_c = fy - CENTER
-    fdist_c = jnp.sqrt(fdx_c * fdx_c + fdy_c * fdy_c)
-    safe_dist = jnp.maximum(fdist_c, 1e-3)
-    radial_cos = fdx_c / safe_dist           # unit outward direction
-    radial_sin = fdy_c / safe_dist
-    # bearing_radial = heading rotated by -radial_angle, i.e. project onto outward / tangent.
-    bearing_radial_cos = cos_a * radial_cos + sin_a * radial_sin    # +1 = outbound, -1 = inbound
-    bearing_radial_sin = -cos_a * radial_sin + sin_a * radial_cos   # tangential component
-    is_heading_inward = (bearing_radial_cos < 0.0)                  # bool
-
-    fleet_features = jnp.stack(
-        [
-            fleet_active.astype(jnp.float32),                        # 0
-            f_is_me.astype(jnp.float32),                             # 1
-            f_is_enemy.astype(jnp.float32),                          # 2
-            _fleet_ships_log_norm(fleet_ships),                      # 3
-            cos_a,                                                   # 4
-            sin_a,                                                   # 5
-            fx / BOARD_SIZE,                                         # 6
-            fy / BOARD_SIZE,                                         # 7
-            speed / state.ship_speed,                                # 8
-            vx / state.ship_speed,                                   # 9
-            vy / state.ship_speed,                                   # 10
-            fdist_c / DIST_DENOM,                                    # 11
-            bearing_radial_cos,                                      # 12  (outbound/inbound)
-            bearing_radial_sin,                                      # 13  (tangential)
-            is_heading_inward.astype(jnp.float32),                   # 14
-        ],
-        axis=-1,
-    )                                                                # (F, 15)
-    fleet_features = jnp.where(fleet_active[:, None], fleet_features, 0.0)
-    fleet_mask = fleet_active
-
-    # ---------------- Global features --------------------------------------
-    my_planet_count = jnp.sum(owner_is_me.astype(jnp.float32))
-    enemy_planet_count = jnp.sum(owner_is_enemy.astype(jnp.float32))
-    neutral_planet_count = jnp.sum(owner_is_neutral.astype(jnp.float32))
-
-    my_prod = jnp.sum(jnp.where(owner_is_me, production, 0.0))
-    enemy_prod = jnp.sum(jnp.where(owner_is_enemy, production, 0.0))
-
-    my_ships = jnp.sum(jnp.where(owner_is_me, ships, 0.0))
-    enemy_ships = jnp.sum(jnp.where(owner_is_enemy, ships, 0.0))
-
-    prod_lead = (my_prod - enemy_prod) / (my_prod + enemy_prod + 1.0)
-    ship_lead = (my_ships - enemy_ships) / (my_ships + enemy_ships + 1.0)
-
-    active_comets = jnp.sum(state.comets.active.astype(jnp.float32))
-
-    my_fleet_ships = jnp.sum(jnp.where(f_is_me, fleet_ships, 0.0))
-    enemy_fleet_ships = jnp.sum(jnp.where(f_is_enemy, fleet_ships, 0.0))
-    my_fleet_count = jnp.sum(f_is_me.astype(jnp.float32))
-    enemy_fleet_count = jnp.sum(f_is_enemy.astype(jnp.float32))
-
-    turn = state.step.astype(jnp.float32) / jnp.maximum(state.episode_steps.astype(jnp.float32), 1.0)
-
-    my_largest_ships = jnp.max(jnp.where(owner_is_me, ships, 0.0))
-    enemy_largest_ships = jnp.max(jnp.where(owner_is_enemy, ships, 0.0))
-    my_largest_prod = jnp.max(jnp.where(owner_is_me, production, 0.0))
-    enemy_largest_prod = jnp.max(jnp.where(owner_is_enemy, production, 0.0))
-
-    # Steps until next comet spawn (normalized to episode_steps).
-    cur_step = state.step.astype(jnp.float32)
-    ep = jnp.maximum(state.episode_steps.astype(jnp.float32), 1.0)
-    spawn_arr = jnp.asarray(COMET_SPAWN_STEPS, dtype=jnp.float32)
-    delta = spawn_arr - cur_step
-    # Replace past spawn steps with a large positive so they don't win the min.
-    delta = jnp.where(delta > 0.0, delta, ep)
-    next_comet_in = jnp.min(delta) / ep                    # in (0, 1]
-
-    is_late_game = (turn > jnp.float32(0.5)).astype(jnp.float32)
-
-    global_features = jnp.stack(
-        [
-            turn,                                                    # 0
-            1.0 - turn,                                              # 1
-            my_planet_count / jnp.float32(MAX_PLANETS),              # 2
-            enemy_planet_count / jnp.float32(MAX_PLANETS),           # 3
-            neutral_planet_count / jnp.float32(MAX_PLANETS),         # 4
-            my_prod / jnp.float32(50.0),                             # 5
-            enemy_prod / jnp.float32(50.0),                          # 6
-            _ships_log_norm(my_ships),                               # 7
-            _ships_log_norm(enemy_ships),                            # 8
-            prod_lead,                                               # 9
-            ship_lead,                                               # 10
-            active_comets / jnp.float32(MAX_COMET_GROUPS),           # 11
-            _fleet_ships_log_norm(my_fleet_ships),                   # 12
-            _fleet_ships_log_norm(enemy_fleet_ships),                # 13
-            my_fleet_count / jnp.float32(MAX_FLEETS),                # 14
-            enemy_fleet_count / jnp.float32(MAX_FLEETS),             # 15
-            _ships_log_norm(my_largest_ships),                       # 16
-            _ships_log_norm(enemy_largest_ships),                    # 17
-            my_largest_prod / PRODUCTION_DENOM,                      # 18
-            enemy_largest_prod / PRODUCTION_DENOM,                   # 19
-            next_comet_in,                                           # 20
-            is_late_game,                                            # 21
-        ],
-        axis=-1,
-    )                                                                # (22,)
 
     return {
         "planet_features": planet_features,

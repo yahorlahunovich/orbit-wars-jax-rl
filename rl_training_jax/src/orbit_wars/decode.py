@@ -47,7 +47,7 @@ BUCKET_COUNT = 8
 MIN_LAUNCH_SHIPS = 4
 SUN_PATH_MARGIN = 1.5
 PATH_PLANET_MARGIN = 1.0
-INTERCEPT_ITERATIONS = 25
+INTERCEPT_ITERATIONS = 5
 
 
 # Launch offset to avoid spawning fleets inside the source planet.
@@ -107,40 +107,40 @@ def path_crosses_sun(
 def path_blocked_by_planets(
     start_x: jnp.ndarray,
     start_y: jnp.ndarray,
-    aim_x: jnp.ndarray,
-    aim_y: jnp.ndarray,
+    target_x: jnp.ndarray,
+    target_y: jnp.ndarray,
     planet_x: jnp.ndarray,
     planet_y: jnp.ndarray,
     planet_radius: jnp.ndarray,
     planet_active: jnp.ndarray,
     margin: float = PATH_PLANET_MARGIN,
 ) -> jnp.ndarray:
-    """True when a third active planet intersects the launch→aim segment.
+    """True when a third active planet intersects the start→target segment.
 
-    Shape: inputs `(P_src, P_tgt, B)` for start/aim; planet arrays `(P,)`.
-    Returns `(P_src, P_tgt, B)`.
+    Shape: inputs `(P_src, P_tgt)` for start/target; planet arrays `(P,)`.
+    Returns `(P_src, P_tgt)`.
     """
     p = planet_x.shape[0]
     slot = jnp.arange(p)
-    src_i = slot[:, None, None, None]
-    tgt_i = slot[None, :, None, None]
-    obs_i = slot[None, None, :, None]
+    src_i = slot[:, None, None]
+    tgt_i = slot[None, :, None]
+    obs_i = slot[None, None, :]
 
     is_obstacle = (
-        planet_active[None, None, :, None]
+        planet_active[None, None, :]
         & (obs_i != src_i)
         & (obs_i != tgt_i)
     )
-    obs_r = (planet_radius + margin)[None, None, :, None]
-    ox = planet_x[None, None, :, None]
-    oy = planet_y[None, None, :, None]
+    obs_r = (planet_radius + margin)[None, None, :]
+    ox = planet_x[None, None, :]
+    oy = planet_y[None, None, :]
 
-    sx = start_x[:, :, None, :]
-    sy = start_y[:, :, None, :]
-    ax = aim_x[:, :, None, :]
-    ay = aim_y[:, :, None, :]
+    sx = start_x[:, :, None]
+    sy = start_y[:, :, None]
+    tx = target_x[:, :, None]
+    ty = target_y[:, :, None]
 
-    d = point_to_segment_distance(ox, oy, sx, sy, ax, ay)
+    d = point_to_segment_distance(ox, oy, sx, sy, tx, ty)
     return jnp.any((d <= obs_r) & is_obstacle, axis=2)
 
 
@@ -232,14 +232,19 @@ def compose_action_grid(
     # Mask when centre→aim crosses the sun (matches heuristic pre-filter).
     sun_blocks = path_crosses_sun(center_x, center_y, aim_x, aim_y, margin=SUN_PATH_MARGIN)
     if enable_planet_block:
-        planet_blocks = path_blocked_by_planets(
-            center_x, center_y, aim_x, aim_y, x, y, radius, active, margin=PATH_PLANET_MARGIN,
+        center_x_2d = jnp.broadcast_to(x[:, None], (p_count, p_count))
+        center_y_2d = jnp.broadcast_to(y[:, None], (p_count, p_count))
+        tgt_x_2d = jnp.broadcast_to(x[None, :], (p_count, p_count))
+        tgt_y_2d = jnp.broadcast_to(y[None, :], (p_count, p_count))
+        pb_2d = path_blocked_by_planets(
+            center_x_2d, center_y_2d, tgt_x_2d, tgt_y_2d, x, y, radius, active, margin=PATH_PLANET_MARGIN,
         )
+        planet_blocks = jnp.broadcast_to(pb_2d[:, :, None], (p_count, p_count, bucket_axis))
     else:
         planet_blocks = jnp.zeros_like(sun_blocks, dtype=jnp.bool_)
 
     self_target = jnp.eye(planets.shape[0], dtype=jnp.bool_)
-    target_valid_pair = target_valid[None, :] & (~self_target)
+    target_valid_pair = target_valid[None, :]
     pair_valid = source_valid[:, None] & target_valid_pair
 
     bucket_valid = bucket_validity_mask(ship_counts, src_ships_grid)       # (P, P, B)
