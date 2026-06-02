@@ -327,10 +327,12 @@ def estimate_intercept_angles(
     max_speed: jnp.ndarray,
     comets: Any = None,
     n_iter: int = 6,
+    sun_margin: float = 1.5,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     aim_x, aim_y, _turns, blocked = solve_intercept_with_wait(
         src_x, src_y, src_r, tgt_id, tgt_x, tgt_y, tgt_r, tgt_is_orbiting,
-        ship_counts, angular_velocity, max_speed, comets=comets, n_iter=n_iter
+        ship_counts, angular_velocity, max_speed, comets=comets, n_iter=n_iter,
+        sun_margin=sun_margin,
     )
     angle = jnp.arctan2(aim_y - src_y, aim_x - src_x)
     return angle, aim_x, aim_y, blocked

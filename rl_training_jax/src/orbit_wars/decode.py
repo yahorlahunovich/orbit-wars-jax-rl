@@ -115,6 +115,8 @@ def compose_action_grid(
     player: jnp.int32 | int,
     *,
     intercept_iterations: int = INTERCEPT_ITERATIONS,
+    sun_path_margin: float = SUN_PATH_MARGIN,
+    path_planet_margin: float = PATH_PLANET_MARGIN,
     enable_planet_block: bool = True,
     enable_incoming_projection: bool = True,
 ) -> dict[str, jnp.ndarray]:
@@ -166,6 +168,7 @@ def compose_action_grid(
         tgt_orb_b, ship_counts,
         state.angular_velocity, state.ship_speed,
         comets=state.comets, n_iter=intercept_iterations,
+        sun_margin=sun_path_margin,
     )
 
     if enable_planet_block:
@@ -174,7 +177,7 @@ def compose_action_grid(
         tgt_x_2d = jnp.broadcast_to(x[None, :], (p_count, p_count))
         tgt_y_2d = jnp.broadcast_to(y[None, :], (p_count, p_count))
         pb_2d = path_blocked_by_planets(
-            center_x_2d, center_y_2d, tgt_x_2d, tgt_y_2d, x, y, radius, active, margin=PATH_PLANET_MARGIN,
+            center_x_2d, center_y_2d, tgt_x_2d, tgt_y_2d, x, y, radius, active, margin=path_planet_margin,
         )
         planet_blocks = jnp.broadcast_to(pb_2d[:, :, None], (p_count, p_count, bucket_axis))
     else:

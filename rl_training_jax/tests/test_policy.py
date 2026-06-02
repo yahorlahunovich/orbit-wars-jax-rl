@@ -10,8 +10,6 @@ import pytest
 
 from policy import PlanetPolicy, init_policy
 from orbit_wars import (
-    FLEET_FEATURE_DIM,
-    GLOBAL_FEATURE_DIM,
     MAX_FLEETS,
     MAX_PLANETS,
     PLANET_FEATURE_DIM,
@@ -24,9 +22,6 @@ def _example_batch(batch: int = 2):
     return {
         "planet_features": jnp.zeros((batch, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((batch, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((batch, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.ones((batch, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((batch, GLOBAL_FEATURE_DIM), jnp.float32),
     }
 
 
