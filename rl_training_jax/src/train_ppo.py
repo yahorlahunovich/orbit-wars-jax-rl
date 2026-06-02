@@ -732,12 +732,12 @@ def train(cfg: TrainConfig) -> None:
             learner_wins = learner_losses = learner_draws = 0
 
         update_opp = False
-        if active_mode == "selfplay":
-            if not np.isnan(wr_100) and wr_100 > 0.54:
-                log_print(f"Update {update_idx}: Self-play winrate {wr_100:.1%} > 54% (100 games). Updating opponent parameters.")
+        if active_mode == "selfplay" and update_idx % 5 == 0:
+            if not np.isnan(wr_100) and wr_100 > 0.56:
+                log_print(f"Update {update_idx}: Self-play winrate {wr_100:.1%} > 56% (100 games). Updating opponent parameters.")
                 update_opp = True
-            elif not np.isnan(wr_200) and wr_200 > 0.56:
-                log_print(f"Update {update_idx}: Self-play winrate {wr_200:.1%} > 56% (200 games). Updating opponent parameters.")
+            elif not np.isnan(wr_200) and wr_200 > 0.54:
+                log_print(f"Update {update_idx}: Self-play winrate {wr_200:.1%} > 54% (200 games). Updating opponent parameters.")
                 update_opp = True
         
         if update_opp:
