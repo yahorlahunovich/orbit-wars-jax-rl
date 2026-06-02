@@ -373,7 +373,14 @@ def rollout_step_selfplay_factory(model: PlanetPolicy, grid_fn):
         # Auto-reset
         idx = jax.random.randint(k_pool, (states.step.shape[0],), 0, reset_pool.step.shape[0])
         resets = jax.tree_util.tree_map(lambda x: x[idx], reset_pool)
-        next_states = jax.tree_util.tree_map(lambda s, r: jnp.where(dones, r, s), new_states, resets)
+        
+        def _reset_where(d, r, s):
+            mask = d
+            for _ in range(r.ndim - 1):
+                mask = mask[..., None]
+            return jnp.where(mask, r, s)
+
+        next_states = jax.tree_util.tree_map(lambda s, r: _reset_where(dones, r, s), new_states, resets)
         
         # Cycle learner seats
         new_learner_players = jax.random.randint(k_lp, (states.step.shape[0],), 0, 2)
