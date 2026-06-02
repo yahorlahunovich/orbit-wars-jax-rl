@@ -73,37 +73,41 @@ def _masked_log_softmax(logits: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
 
 def joint_log_prob_and_entropy(
     target_logits: jnp.ndarray,         # (N, P, P)
-    bucket_logits: jnp.ndarray,         # (N, P, BUCKETS)
+    bucket_logits: jnp.ndarray,         # (N, P, P, BUCKETS)
     target_has_bucket: jnp.ndarray,     # (N, P, P) bool
     bucket_valid: jnp.ndarray,          # (N, P, P, BUCKETS) bool
     target_idx: jnp.ndarray,            # (N, P) int32
     bucket_idx: jnp.ndarray,            # (N, P) int32
-    source_valid: jnp.ndarray,          # (N, P) bool
+    executed_mask: jnp.ndarray,         # (N, P) bool
 ) -> dict[str, jnp.ndarray]:
     """Return joint log_prob, per-row entropy contributions, all masked by
-    `source_valid` so PPO can flatten and average."""
+    `executed_mask` so PPO can flatten and average."""
     tgt_lp = _masked_log_softmax(target_logits, target_has_bucket)        # (N, P, P)
     tgt_lp_sel = jnp.take_along_axis(tgt_lp, target_idx[..., None], axis=-1).squeeze(-1)
-    tgt_lp_sel = jnp.where(source_valid, tgt_lp_sel, 0.0)
+    tgt_lp_sel = jnp.where(executed_mask, tgt_lp_sel, 0.0)
 
     # Per-source entropy of the target distribution (sum over targets).
     tgt_p = jnp.exp(tgt_lp) * target_has_bucket.astype(tgt_lp.dtype)
     entropy_target = -jnp.sum(tgt_p * tgt_lp, axis=-1)                    # (N, P)
-    entropy_target = jnp.where(source_valid, entropy_target, 0.0)
+    entropy_target = jnp.where(executed_mask, entropy_target, 0.0)
 
-    # Gather bucket validity for the *chosen* target.
+    # Gather bucket logits and validity for the *chosen* target (Point 3).
+    b_idx = jnp.arange(target_idx.shape[0])[:, None]
+    p_idx = jnp.arange(target_idx.shape[1])[None, :]
+    chosen_bucket_logits = bucket_logits[b_idx, p_idx, target_idx]
+
     chosen_bucket_valid = jnp.take_along_axis(
         bucket_valid,
         target_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1),
         axis=2,
     ).squeeze(2)                                                          # (N, P, BUCKETS)
-    bkt_lp = _masked_log_softmax(bucket_logits, chosen_bucket_valid)
+    bkt_lp = _masked_log_softmax(chosen_bucket_logits, chosen_bucket_valid)
     bkt_lp_sel = jnp.take_along_axis(bkt_lp, bucket_idx[..., None], axis=-1).squeeze(-1)
-    bkt_lp_sel = jnp.where(source_valid, bkt_lp_sel, 0.0)
+    bkt_lp_sel = jnp.where(executed_mask, bkt_lp_sel, 0.0)
 
     bkt_p = jnp.exp(bkt_lp) * chosen_bucket_valid.astype(bkt_lp.dtype)
     entropy_bucket = -jnp.sum(bkt_p * bkt_lp, axis=-1)
-    entropy_bucket = jnp.where(source_valid, entropy_bucket, 0.0)
+    entropy_bucket = jnp.where(executed_mask, entropy_bucket, 0.0)
 
     return {
         "log_prob": tgt_lp_sel + bkt_lp_sel,
@@ -136,7 +140,7 @@ def ppo_loss_fn(
         fleet_features  (N, F, F_f), fleet_mask  (N, F),
         global_features (N, F_g)
             — encoder outputs (recomputed at minibatch time).
-        target_idx, bucket_idx, source_valid, old_log_prob   (N, P)
+        target_idx, bucket_idx, executed_mask, old_log_prob   (N, P)
             — chosen actions and per-source validity from rollout time.
         target_has_bucket (N, P, P) bool, bucket_valid (N, P, P, BUCKETS) bool
             — frozen action-grid masks captured at rollout time.
@@ -147,7 +151,7 @@ def ppo_loss_fn(
         params,
         planet_features=batch["planet_features"],
         planet_mask=batch["planet_mask"],
-    )                                                # value (N,), target_logits (N,P,P), bucket_logits (N,P,B)
+    )                                                # value (N,), target_logits (N,P,P), bucket_logits (N,P,P,B)
 
     info = joint_log_prob_and_entropy(
         target_logits=out.target_logits,
@@ -156,7 +160,7 @@ def ppo_loss_fn(
         bucket_valid=batch["bucket_valid"],
         target_idx=batch["target_idx"],
         bucket_idx=batch["bucket_idx"],
-        source_valid=batch["source_valid"],
+        executed_mask=batch["executed_mask"],
     )
     new_log_prob = info["log_prob"]                  # (N, P)
     entropy = info["entropy_target"] + info["entropy_bucket"]   # (N, P)
@@ -171,8 +175,8 @@ def ppo_loss_fn(
     adv_norm = (adv_env - adv_mean) / jnp.maximum(adv_std, 1e-8)
     
     returns_env = batch["returns"]                   # (N,)
-    source_valid = batch["source_valid"]             # (N, P)
-    mask_f = source_valid.astype(jnp.float32)
+    executed_mask = batch["executed_mask"]           # (N, P)
+    mask_f = executed_mask.astype(jnp.float32)
     mask_count = jnp.maximum(jnp.sum(mask_f), 1.0)
 
     adv = adv_norm[:, None]                          # (N, 1) — broadcast normalized across sources

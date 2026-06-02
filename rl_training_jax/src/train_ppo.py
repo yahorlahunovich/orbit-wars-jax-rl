@@ -1,211 +1,177 @@
-"""PPO trainer for the JAX Transformer Orbit Wars policy.
-
-End-to-end design:
-
-- `num_envs` envs are stacked via `tree_map(jnp.stack)` and stepped with
-  `jax.vmap(step_jit)` inside a `jax.lax.scan` of length `rollout_steps`.
-- Self-play: both players use the same `params`. Per env we randomly assign
-  which player is the learner at reset time; PPO trains on the learner's
-  decision rows only.
-- Optional curriculum: train vs `versions/kaggle700_current_heuristic` until a
-  rolling win-rate threshold is met, then continue self-play.
-- Reward: pure terminal +1 / 0 / -1 from `state.rewards[learner_player]`.
-  No shaping.
-- GAE: gamma = 0.9999, lambda = 0.95 by default.
-- Optimizer: optax cosine-decayed LR with `clip_by_global_norm`.
-
-The trainer is structured so the rollout and the PPO update each live in a
-single jit. Comet spawning happens host-side only when the env step reaches
-one of `COMET_SPAWN_STEPS`; otherwise the entire rollout stays on device.
-"""
+"""JAX PPO training for Orbit Wars."""
 
 from __future__ import annotations
 
 import argparse
 import functools
-import math
-import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import flax.serialization
 import jax
 import jax.numpy as jnp
-import jax.tree_util as tu
 import numpy as np
 import optax
+import yaml
 
 from orbit_wars import (
     BUCKET_COUNT,
-    COMET_SPAWN_STEPS,
-    FLEET_FEATURE_DIM,
-    GLOBAL_FEATURE_DIM,
     MAX_FLEETS,
     MAX_MOVES_PER_PLAYER,
     MAX_PLANETS,
     PLANET_FEATURE_DIM,
-    batched_step,
+    OrbitWarsState,
     compose_action_grid,
     encode_observation,
     reset,
 )
-from orbit_wars.decode import INTERCEPT_ITERATIONS
-from orbit_wars.heuristic_opponent import batched_heuristic_actions, load_heuristic_agent
 from orbit_wars.rollout import pack_padded_actions, sample_actions
-from orbit_wars.state import OrbitWarsState
-from orbit_wars.step import _maybe_spawn_comet_numpy
-from policy import PlanetPolicy
 from ppo import compute_gae, explained_variance, ppo_loss_fn
+from policy import PlanetPolicy
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
+@dataclass(frozen=True)
 class TrainConfig:
     seed: int = 0
     run_name: str = "jax_ppo_transformer"
     save_dir: str = "artifacts"
 
-    # Env / batch
-    num_envs: int = 16
-    episode_steps: int = 200
+    # Env
+    num_envs: int = 32
+    episode_steps: int = 500
     rollout_steps: int = 32
-    intercept_iterations: int = INTERCEPT_ITERATIONS
-    enable_planet_block: bool = True
-    enable_incoming_projection: bool = True
 
     # Model
     d_model: int = 96
     num_heads: int = 4
     num_layers: int = 3
-    bucket_count: int = BUCKET_COUNT
+    bucket_count: int = 8
+    weight_decay: float = 1e-4
 
     # PPO
-    total_updates: int = 200
+    total_updates: int = 5000
     epochs: int = 3
-    minibatch_size: int = 1024
+    minibatch_size: int = 256
     gamma: float = 0.9999
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.05  # Increased to fight policy collapse
     vf_coef: float = 0.5
     lr_start: float = 1e-3
     lr_end: float = 1e-5
     max_grad_norm: float = 0.5
-    weight_decay: float = 0.0
 
-    # Logging / checkpoint
-    log_every: int = 1
-    checkpoint_every: int = 50
-
-    # Opponent / curriculum
+    # Opponent
     opponent: str = "selfplay"  # selfplay | heuristic | curriculum
-    heuristic_win_rate: float = 0.35
-    heuristic_window_episodes: int = 80
-    heuristic_path: str | None = None
+    heuristic_win_rate: float = 0.6
+    heuristic_window_episodes: int = 100
+
+    log_every: int = 5
+    checkpoint_every: int = 100
 
 
 def load_config(path: str | Path) -> TrainConfig:
-    import yaml
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
 
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     env = data.get("env", {})
     model = data.get("model", {})
     ppo = data.get("ppo", {})
-    training = data.get("training", {})
-    heur_path = training.get("heuristic_path")
+    opp = data.get("opponent", {})
+
     return TrainConfig(
         seed=int(data.get("seed", 0)),
         run_name=str(data.get("run_name", "jax_ppo_transformer")),
         save_dir=str(data.get("save_dir", "artifacts")),
-        num_envs=int(env.get("num_envs", 16)),
-        episode_steps=int(env.get("episode_steps", 200)),
+        num_envs=int(env.get("num_envs", 32)),
+        episode_steps=int(env.get("episode_steps", 500)),
         rollout_steps=int(env.get("rollout_steps", 32)),
-        intercept_iterations=int(env.get("intercept_iterations", INTERCEPT_ITERATIONS)),
-        enable_planet_block=bool(env.get("enable_planet_block", True)),
-        enable_incoming_projection=bool(env.get("enable_incoming_projection", True)),
         d_model=int(model.get("d_model", 96)),
         num_heads=int(model.get("num_heads", 4)),
         num_layers=int(model.get("num_layers", 3)),
-        bucket_count=int(model.get("bucket_count", BUCKET_COUNT)),
-        total_updates=int(ppo.get("total_updates", 200)),
+        bucket_count=int(model.get("bucket_count", 8)),
+        weight_decay=float(model.get("weight_decay", 1e-4)),
+        total_updates=int(ppo.get("total_updates", 5000)),
         epochs=int(ppo.get("epochs", 3)),
-        minibatch_size=int(ppo.get("minibatch_size", 1024)),
+        minibatch_size=int(ppo.get("minibatch_size", 256)),
         gamma=float(ppo.get("gamma", 0.9999)),
         gae_lambda=float(ppo.get("gae_lambda", 0.95)),
         clip_coef=float(ppo.get("clip_coef", 0.2)),
-        ent_coef=float(ppo.get("ent_coef", 0.01)),
+        ent_coef=float(ppo.get("ent_coef", 0.05)),
         vf_coef=float(ppo.get("vf_coef", 0.5)),
         lr_start=float(ppo.get("lr_start", 1e-3)),
         lr_end=float(ppo.get("lr_end", 1e-5)),
         max_grad_norm=float(ppo.get("max_grad_norm", 0.5)),
-        weight_decay=float(ppo.get("weight_decay", 0.0)),
-        log_every=int(data.get("log_every", 1)),
-        checkpoint_every=int(data.get("checkpoint_every", 50)),
-        opponent=str(training.get("opponent", "selfplay")),
-        heuristic_win_rate=float(training.get("heuristic_win_rate", 0.35)),
-        heuristic_window_episodes=int(training.get("heuristic_window_episodes", 80)),
-        heuristic_path=None if heur_path in (None, "null") else str(heur_path),
+        opponent=str(data.get("opponent", "selfplay")),
+        heuristic_win_rate=float(opp.get("win_rate", 0.6)),
+        heuristic_window_episodes=int(opp.get("window_episodes", 100)),
+        log_every=int(data.get("log_every", 5)),
+        checkpoint_every=int(data.get("checkpoint_every", 100)),
     )
 
 
 # ---------------------------------------------------------------------------
-# Env management (host-side comet spawn + on-device step)
+# Batched heuristic helpers
 # ---------------------------------------------------------------------------
 
 
-def make_initial_states(cfg: TrainConfig, seed_base: int) -> tuple[OrbitWarsState, np.ndarray]:
-    """Build initial batched states and per-env learner-player assignment."""
-    rng = random.Random(seed_base)
-    states = []
-    learner_players = np.zeros(cfg.num_envs, dtype=np.int32)
-    for i in range(cfg.num_envs):
-        states.append(reset(seed_base + i, episode_steps=cfg.episode_steps))
-        learner_players[i] = rng.randint(0, 1)
-    batched = tu.tree_map(lambda *xs: jnp.stack(xs), *states)
-    return batched, learner_players
+def _load_heuristic_agent():
+    import importlib.util
+    import sys
+
+    repo_root = Path(__file__).resolve().parents[2]
+    path = repo_root / "versions/kaggle700_current_heuristic/main.py"
+    heur_root = path.parent
+    sys.path.insert(0, str(heur_root))
+    spec = importlib.util.spec_from_file_location("heuristic_main", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod.agent
 
 
-def maybe_spawn_comets_host(batched_states: OrbitWarsState, cfg: TrainConfig) -> OrbitWarsState:
-    """Run host-side comet spawn on each env only when the env's next step is
-    a comet-spawn step. Cheap: 0 envs touch most updates."""
-    next_step = int(np.asarray(batched_states.step)[0]) + 1
-    if next_step not in COMET_SPAWN_STEPS:
-        return batched_states
-    new_states = []
-    n = int(batched_states.step.shape[0])
-    for i in range(n):
-        single = tu.tree_map(lambda x, i=i: x[i], batched_states)
-        new_states.append(_maybe_spawn_comet_numpy(single))
-    return tu.tree_map(lambda *xs: jnp.stack(xs), *new_states)
+def batched_heuristic_actions(states: OrbitWarsState, players: np.ndarray, agent):
+    """Call the heuristic agent for every env in the batch via Python loop."""
+    from orbit_wars.convert import state_to_observation_dict
+    from orbit_wars.step import _list_action_to_padded
+
+    b = states.step.shape[0]
+    a0_list, a1_list = [], []
+    m0_list, m1_list = [], []
+
+    for i in range(b):
+        single_state = jax.tree_util.tree_map(lambda x: x[i], states)
+        # Agent expects its own seat in obs["player"].
+        p = int(players[i])
+        obs = state_to_observation_dict(single_state, player=p)
+        moves = agent(obs)
+
+        # Convert list moves to padded (MAX_MOVES, 3) + mask.
+        row, mask = _list_action_to_padded(moves)
+        if p == 0:
+            a0_list.append(row)
+            m0_list.append(mask)
+            a1_list.append(jnp.zeros_like(row))
+            m1_list.append(jnp.zeros_like(mask))
+        else:
+            a0_list.append(jnp.zeros_like(row))
+            m0_list.append(jnp.zeros_like(mask))
+            a1_list.append(row)
+            m1_list.append(mask)
+
+    return (
+        jnp.stack(a0_list),
+        jnp.stack(m0_list),
+        jnp.stack(a1_list),
+        jnp.stack(m1_list),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Rollout (one rollout-step batched across envs)
+# Rollout / Sampling logic
 # ---------------------------------------------------------------------------
-
-
-def policy_apply_factory(model: PlanetPolicy):
-    def apply_fn(params, **kwargs):
-        return model.apply(params, **kwargs)
-
-    return jax.jit(apply_fn)
-
-
-def _gather_by_player(zero_t, one_t, learner_players: jnp.ndarray):
-    """Select per-env rows from player-0 or player-1 tensors."""
-    lp = learner_players.astype(jnp.bool_)
-    if zero_t.ndim == 1:
-        return jnp.where(lp, one_t, zero_t)
-    if zero_t.ndim == 2:
-        return jnp.where(lp[:, None], one_t, zero_t)
-    if zero_t.ndim == 3:
-        return jnp.where(lp[:, None, None], one_t, zero_t)
-    return jnp.where(lp[:, None, None, None], one_t, zero_t)
 
 
 def sample_both_players_factory(model: PlanetPolicy, grid_fn):
@@ -219,7 +185,6 @@ def sample_both_players_factory(model: PlanetPolicy, grid_fn):
         feats1 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(1))
         
         def _gather_feats(f0, f1, is_p0):
-            # Expands the (B,) mask to the shape of f0/f1 for jnp.where
             mask = is_p0
             for _ in range(f0.ndim - 1):
                 mask = mask[..., None]
@@ -239,13 +204,13 @@ def sample_both_players_factory(model: PlanetPolicy, grid_fn):
 
         grid0 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(0))
         s0 = sample_actions(k0, out0.target_logits, out0.bucket_logits, grid0)
-        a0, m0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
+        a0, m0, em0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
 
         grid1 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(1))
         s1 = sample_actions(k1, out1.target_logits, out1.bucket_logits, grid1)
-        a1, m1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
+        a1, m1, em1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
         
-        return (a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, rng)
+        return (a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, rng)
 
     return sample
 
@@ -260,12 +225,20 @@ def sample_learner_factory(model: PlanetPolicy, grid_fn):
         out = model.apply(params, **feats)
         grid = jax.vmap(grid_fn, in_axes=(0, 0))(states, learner_players)
         sampled = sample_actions(k0, out.target_logits, out.bucket_logits, grid)
-        actions, mask = pack_padded_actions(
-            sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid,
+        actions, mask, executed_mask = pack_padded_actions(
+            sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
         )
-        return actions, mask, sampled, out, grid, feats, rng
+        return actions, mask, executed_mask, sampled, out, grid, feats, rng
 
     return sample
+
+
+def _gather_by_player(one_t, zero_t, lp):
+    """gather(p0_tensor, p1_tensor, learner_players)."""
+    # lp is (B,) int32
+    return jnp.where(lp[:, None, None], zero_t, one_t) if one_t.ndim == 3 else \
+           jnp.where(lp[:, None], zero_t, one_t) if one_t.ndim == 2 else \
+           jnp.where(lp, zero_t, one_t)
 
 
 def learner_record_from_samples(
@@ -278,6 +251,8 @@ def learner_record_from_samples(
     grid1,
     feats0,
     feats1,
+    em0,
+    em1,
     new_states: OrbitWarsState,
 ) -> dict:
     learner_feats = jax.tree_util.tree_map(
@@ -287,7 +262,7 @@ def learner_record_from_samples(
     target_idx = _gather_by_player(s0["target_idx"], s1["target_idx"], learner_players)
     bucket_idx = _gather_by_player(s0["bucket_idx"], s1["bucket_idx"], learner_players)
     log_prob = _gather_by_player(s0["log_prob"], s1["log_prob"], learner_players)
-    source_valid = _gather_by_player(s0["source_valid"], s1["source_valid"], learner_players)
+    executed_mask = _gather_by_player(em0, em1, learner_players)
     target_has_bucket = _gather_by_player(
         jnp.any(grid0["full_valid"], axis=-1),
         jnp.any(grid1["full_valid"], axis=-1),
@@ -320,7 +295,7 @@ def learner_record_from_samples(
         "target_idx": target_idx,
         "bucket_idx": bucket_idx,
         "log_prob": log_prob,
-        "source_valid": source_valid,
+        "executed_mask": executed_mask,
         "target_has_bucket": target_has_bucket,
         "bucket_valid": bucket_valid,
         "value": learner_value,
@@ -336,6 +311,7 @@ def learner_record_from_single(
     out,
     grid,
     feats,
+    executed_mask,
     new_states: OrbitWarsState,
 ) -> dict:
     target_has_bucket = jnp.any(grid["full_valid"], axis=-1)
@@ -356,7 +332,7 @@ def learner_record_from_single(
         "target_idx": sampled["target_idx"],
         "bucket_idx": sampled["bucket_idx"],
         "log_prob": sampled["log_prob"],
-        "source_valid": sampled["source_valid"],
+        "executed_mask": executed_mask,
         "target_has_bucket": target_has_bucket,
         "bucket_valid": bucket_valid,
         "value": out.value,
@@ -373,28 +349,22 @@ def rollout_step_selfplay_factory(model: PlanetPolicy, grid_fn):
     @jax.jit
     def step_one(states: OrbitWarsState, params, opp_params, rng, learner_players, reset_pool):
         rng, k_sample, k_pool, k_lp = jax.random.split(rng, 4)
-        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, k_sample = sample(
+        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, k_sample = sample(
             states, params, opp_params, k_sample, learner_players
         )
         new_states = jax.vmap(step_jit)(states, a0, a1, m0, m1)
         record = learner_record_from_samples(
-            learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, new_states,
+            learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, new_states,
         )
         
         dones = new_states.done
         
         # Auto-reset
-        pool_size = reset_pool.step.shape[0]
-        pool_indices = jax.random.randint(k_pool, (states.step.shape[0],), 0, pool_size)
-        fresh_states = jax.tree_util.tree_map(lambda p: p[pool_indices], reset_pool)
+        idx = jax.random.randint(k_pool, (states.step.shape[0],), 0, reset_pool.step.shape[0])
+        resets = jax.tree_util.tree_map(lambda x: x[idx], reset_pool)
+        next_states = jax.tree_util.tree_map(lambda s, r: jnp.where(dones, r, s), new_states, resets)
         
-        next_states = jax.tree_util.tree_map(
-            lambda new_s, fresh_s: jnp.where(
-                dones[(...,) + (None,) * (new_s.ndim - 1)], fresh_s, new_s
-            ),
-            new_states, fresh_states
-        )
-        
+        # Cycle learner seats
         new_learner_players = jax.random.randint(k_lp, (states.step.shape[0],), 0, 2)
         next_learner_players = jnp.where(dones, new_learner_players, learner_players)
         
@@ -404,7 +374,6 @@ def rollout_step_selfplay_factory(model: PlanetPolicy, grid_fn):
 
 
 def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
-    """Policy learner + frozen heuristic opponent (host-side opponent actions)."""
     sample = sample_learner_factory(model, grid_fn)
     step_jit = __import__("orbit_wars.step", fromlist=["step_jit"]).step_jit
 
@@ -416,7 +385,7 @@ def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
         opponent_players_np: np.ndarray,
         heuristic_agent,
     ):
-        actions, mask, sampled, out, grid, feats, rng = sample(states, params, rng, learner_players)
+        actions, mask, executed_mask, sampled, out, grid, feats, rng = sample(states, params, rng, learner_players)
         ha0, hm0, ha1, hm1 = batched_heuristic_actions(states, opponent_players_np, heuristic_agent)
 
         is_learner_p0 = (learner_players == 0)
@@ -426,33 +395,50 @@ def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
         final_m1 = jnp.where(is_learner_p0[:, None], hm1, mask)
 
         new_states = jax.vmap(step_jit)(states, final_a0, final_a1, final_m0, final_m1)
-        record = learner_record_from_single(learner_players, sampled, out, grid, feats, new_states)
+        record = learner_record_from_single(
+            learner_players, sampled, out, grid, feats, executed_mask, new_states,
+        )
         return new_states, record, rng
 
     return step_one
 
 
 def reset_done_envs(states: OrbitWarsState, dones_np: np.ndarray, next_seed: int, cfg: TrainConfig) -> tuple[OrbitWarsState, int, np.ndarray]:
-    """Host-side resets for envs whose episodes ended. Returns (new_states,
-    next_seed, new_learner_players_for_those_envs)."""
-    n = int(states.step.shape[0])
-    if not dones_np.any():
-        return states, next_seed, np.zeros(n, dtype=np.int32)
-
-    rng = random.Random(next_seed)
-    refreshed = []
-    new_lp = np.zeros(n, dtype=np.int32)
-    states_list = [tu.tree_map(lambda x, i=i: x[i], states) for i in range(n)]
-    for i in range(n):
+    """Host-side resets for envs whose episodes ended. Returns (new_states, next_seed, new_lp)."""
+    new_states_list = []
+    new_lp_list = []
+    for i in range(cfg.num_envs):
         if dones_np[i]:
-            s = reset(next_seed, episode_steps=cfg.episode_steps)
-            new_lp[i] = rng.randint(0, 1)
+            new_states_list.append(reset(next_seed, episode_steps=cfg.episode_steps))
+            new_lp_list.append(next_seed % 2)
             next_seed += 1
-            refreshed.append(s)
         else:
-            refreshed.append(states_list[i])
-    new_states = tu.tree_map(lambda *xs: jnp.stack(xs), *refreshed)
-    return new_states, next_seed, new_lp
+            new_states_list.append(jax.tree_util.tree_map(lambda x: x[i], states))
+            new_lp_list.append(-1) # Placeholder
+    
+    new_states = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *new_states_list)
+    return new_states, next_seed, np.array(new_lp_list)
+
+
+def maybe_spawn_comets_host(states: OrbitWarsState, cfg: TrainConfig) -> OrbitWarsState:
+    from orbit_wars.comet import spawn_comet_for_state
+    
+    steps = np.asarray(states.step)
+    COMET_SPAWN_STEPS = (50, 100, 150)
+    
+    new_states_list = []
+    changed = False
+    for i in range(cfg.num_envs):
+        single = jax.tree_util.tree_map(lambda x: x[i], states)
+        if steps[i] in COMET_SPAWN_STEPS:
+            new_states_list.append(spawn_comet_for_state(single))
+            changed = True
+        else:
+            new_states_list.append(single)
+    
+    if changed:
+        return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *new_states_list)
+    return states
 
 
 # ---------------------------------------------------------------------------
@@ -512,69 +498,58 @@ def train(cfg: TrainConfig) -> None:
 
     grid_fn = functools.partial(
         compose_action_grid,
-        intercept_iterations=cfg.intercept_iterations,
-        enable_planet_block=cfg.enable_planet_block,
-        enable_incoming_projection=cfg.enable_incoming_projection,
+        sun_path_margin=1.5,
+        path_planet_margin=1.0,
+        intercept_iterations=5,
     )
+
     rollout_selfplay = rollout_step_selfplay_factory(model, grid_fn)
     rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model, grid_fn)
     update_step = make_update_step(model, optimizer, cfg)
 
     opponent_mode = cfg.opponent.lower()
     if opponent_mode not in ("selfplay", "heuristic", "curriculum"):
-        raise ValueError(f"unknown opponent mode: {cfg.opponent}")
-    active_mode = "heuristic" if opponent_mode in ("heuristic", "curriculum") else "selfplay"
-    curriculum_switched = False
+        raise ValueError(f"Invalid opponent mode: {opponent_mode}")
 
-    save_dir = Path(cfg.save_dir) / cfg.run_name
-    save_dir.mkdir(parents=True, exist_ok=True)
+    active_mode = "heuristic" if opponent_mode == "curriculum" else opponent_mode
+    heuristic_agent = _load_heuristic_agent() if active_mode == "heuristic" or opponent_mode == "curriculum" else None
     
-    log_file_path = save_dir / "training.log"
-    log_file = log_file_path.open("a", encoding="utf-8")
+    # Pre-generate reset states for selfplay
+    print(f"Generating reset pool of size 256...")
+    reset_pool_list = [reset(s, episode_steps=cfg.episode_steps) for s in range(256)]
+    reset_pool = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *reset_pool_list)
 
-    def log_print(msg: str) -> None:
-        print(msg, flush=True)
-        log_file.write(msg + "\n")
-        log_file.flush()
-
-    heuristic_agent = None
-    if active_mode == "heuristic":
-        heur_path = Path(cfg.heuristic_path) if cfg.heuristic_path else None
-        heuristic_agent = load_heuristic_agent(heur_path)
-        log_print(f"Heuristic opponent loaded from {heur_path or 'default'}")
-
-    # Pre-generate reset pool for auto-reset
-    pool_size = max(256, cfg.num_envs * 4)
-    log_print(f"Generating reset pool of size {pool_size}...")
-    reset_pool_states, _ = make_initial_states(cfg, cfg.seed + 100000)
-    # We need a pool of `pool_size`. make_initial_states uses `num_envs` so we just call it with a custom config.
-    import dataclasses
-    cfg_pool = dataclasses.replace(cfg, num_envs=pool_size)
-    reset_pool, _ = make_initial_states(cfg_pool, cfg.seed + 100000)
-    
-    seed_base = cfg.seed * 10000 + 1
-    states, learner_players_np = make_initial_states(cfg, seed_base)
+    # Init envs
+    states = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *[reset(s, episode_steps=cfg.episode_steps) for s in range(cfg.num_envs)])
+    learner_players_np = np.array([i % 2 for i in range(cfg.num_envs)])
     learner_players = jnp.asarray(learner_players_np)
-    next_seed = seed_base + cfg.num_envs
+    next_seed = cfg.num_envs
 
-    log_print(
-        f"JAX devices: {jax.devices()} | envs={cfg.num_envs} rollout={cfg.rollout_steps} "
-        f"updates={cfg.total_updates} opponent={opponent_mode} active={active_mode}"
-    )
-    log_print(
-        "update |     mode | lrnr_wr | W-L-D | episodes | mean_ret | env_sps | "
-        "  loss | pol_loss | val_loss | entropy |     ev | approx_kl | clip_fr"
-    )
-
-    t_start = time.perf_counter()
+    # Metrics
+    finished_returns_window = []
+    heuristic_returns_window = []
+    curriculum_switched = False
     total_env_steps = 0
-    finished_returns_window: list[float] = []
-    heuristic_returns_window: list[float] = []
     learner_wins = learner_losses = learner_draws = 0
 
+    log_print = print
+    save_dir = Path(cfg.save_dir) / cfg.run_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    header = (
+        "  update |   mode   | lrnr_wr | W-L-D | episodes | mean_ret | env_sps | "
+        "  loss  | pol_loss | val_loss | entropy |   ev   | approx_kl | clip_fr"
+    )
+    log_print(header)
+    log_print("-" * len(header))
+
+    t_start = time.perf_counter()
+
     for update_idx in range(1, cfg.total_updates + 1):
-        t_rollout = time.perf_counter()
+        # ------- Rollout -------
         rollout_records = []
+        t_rollout = time.perf_counter()
+        
         for _ in range(cfg.rollout_steps):
             if active_mode != "selfplay":
                 states = maybe_spawn_comets_host(states, cfg)
@@ -643,10 +618,6 @@ def train(cfg: TrainConfig) -> None:
         values = stack_t("value", rollout_records)                     # (B, T)
 
         adv, ret = compute_gae(rewards, values, dones, next_value, cfg.gamma, cfg.gae_lambda)
-        # Normalize advantages.
-        adv_mean = jnp.mean(adv)
-        adv_std = jnp.std(adv) + 1e-8
-        adv = (adv - adv_mean) / adv_std
 
         # Flatten to (N = B*T, ...).
         def flatten(arr):
@@ -656,7 +627,7 @@ def train(cfg: TrainConfig) -> None:
         flat = {}
         for k in (
             "planet_features", "planet_mask",
-            "target_idx", "bucket_idx", "log_prob", "source_valid",
+            "target_idx", "bucket_idx", "log_prob", "executed_mask",
             "target_has_bucket", "bucket_valid",
         ):
             flat[k] = flatten(stack_t(k, rollout_records))

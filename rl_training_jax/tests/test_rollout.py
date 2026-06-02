@@ -39,6 +39,9 @@ def _make_policy(rng):
     example = {
         "planet_features": jnp.zeros((1, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
+        "fleet_features": jnp.zeros((1, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
+        "fleet_mask": jnp.ones((1, MAX_FLEETS), jnp.bool_),
+        "global_features": jnp.zeros((1, GLOBAL_FEATURE_DIM), jnp.float32),
     }
     params = model.init(rng, **example)
     return model, params
@@ -96,11 +99,12 @@ def test_pack_padded_actions_truncates_to_max_moves():
     grid = jax.vmap(compose_action_grid, in_axes=(0, 0))(batched, players)
     sampled = sample_actions(rng, out.target_logits, out.bucket_logits, grid)
 
-    actions, mask = pack_padded_actions(
+    actions, mask, executed_mask = pack_padded_actions(
         sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
     )
     assert actions.shape == (2, MAX_MOVES_PER_PLAYER, 3)
     assert mask.shape == (2, MAX_MOVES_PER_PLAYER)
+    assert executed_mask.shape == (2, MAX_PLANETS)
     # Mask is non-increasing (valid moves grouped to the front).
     m = np.asarray(mask)
     diff = np.diff(m, axis=-1)
@@ -135,8 +139,6 @@ def test_full_pipeline_actions_execute_in_env():
     # New fleets >= number of valid moves; could be lower if some moves
     # collided with sun mid-step (shouldn't here, but be generous):
     delta = n_fleets_after - n_fleets_before
-    # The env counts launched fleets immediately; collisions can remove some
-    # right after, but launch counts up to MAX_FLEETS - n_before.
     assert np.all(delta >= 0)
     assert np.all(delta <= moves_per_env)
 

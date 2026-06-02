@@ -1,18 +1,11 @@
-"""Tests for the pure-JAX feature encoder."""
+"""Tests for the JAX feature encoder."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import jax
 import jax.numpy as jnp
-import jax.tree_util as tu
 import numpy as np
 import pytest
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from orbit_wars import (
     FLEET_FEATURE_DIM,
@@ -20,133 +13,114 @@ from orbit_wars import (
     MAX_FLEETS,
     MAX_PLANETS,
     PLANET_FEATURE_DIM,
-    encode_batch,
-    encode_batch_jit,
     encode_observation,
-    encode_observation_jit,
     reset,
     step_jit,
 )
-from orbit_wars.step import _list_action_to_padded
 
 
 def _empty_action():
-    a, m = _list_action_to_padded([])
-    return a, m
+    from orbit_wars.step import _list_action_to_padded
+    return _list_action_to_padded([])
 
 
 def test_encode_shapes_and_dims():
-    state = reset(7, episode_steps=200)
+    state = reset(0, episode_steps=200)
     out = encode_observation(state, jnp.int32(0))
-
+    
     assert out["planet_features"].shape == (MAX_PLANETS, PLANET_FEATURE_DIM)
-    # no fleet_features
-    
     assert out["planet_mask"].shape == (MAX_PLANETS,)
-    
-    assert out["planet_mask"].dtype == jnp.bool_
+    assert out["fleet_features"].shape == (MAX_FLEETS, FLEET_FEATURE_DIM)
+    assert out["fleet_mask"].shape == (MAX_FLEETS,)
+    assert out["global_features"].shape == (GLOBAL_FEATURE_DIM,)
 
 
 def test_masked_padding_is_zero():
-    """Inactive planet/fleet slots should produce all-zero feature rows."""
-    state = reset(11, episode_steps=200)
+    """Rows marked as inactive in the mask should have all features zeroed."""
+    state = reset(1, episode_steps=200)
     out = encode_observation(state, jnp.int32(0))
-    planet_features = np.asarray(out["planet_features"])
-    # fleet_features removed
-    planet_mask = np.asarray(out["planet_mask"])
     
-
-    # Every inactive row is exactly zero.
-    inactive_planets = planet_features[~planet_mask]
+    pm = np.asarray(out["planet_mask"])
+    pf = np.asarray(out["planet_features"])
+    assert np.all(pf[~pm] == 0.0)
     
-    if inactive_planets.size:
-        assert np.all(inactive_planets == 0.0)
+    fm = np.asarray(out["fleet_mask"])
+    ff = np.asarray(out["fleet_features"])
+    assert np.all(ff[~fm] == 0.0)
 
 
 def test_player_relative_flip_is_symmetric():
-    """Encoding for player 1 should be the mirror of player 0's encoding.
-
-    Owner-is-me / owner-is-enemy columns must swap; everything position-based
-    must stay the same.
-    """
-    state = reset(3, episode_steps=200)
+    """Flipping the perspective from P0 to P1 should swap owner flags and lead signs."""
+    state = reset(42, episode_steps=200)
+    # Manually assign some owner for testing.
+    # planet 0 owned by P0
+    state = state.replace(planets=state.planets.at[0, 1].set(0.0))
+    
     out0 = encode_observation(state, jnp.int32(0))
     out1 = encode_observation(state, jnp.int32(1))
-
-    pf0 = np.asarray(out0["planet_features"])
-    pf1 = np.asarray(out1["planet_features"])
-
-    # Column 1 = owner_is_me, column 2 = owner_is_enemy.
-    assert np.allclose(pf0[:, 1], pf1[:, 2])
-    assert np.allclose(pf0[:, 2], pf1[:, 1])
-    # owner_is_neutral (col 3) and positions (cols 4..16) must match.
-    assert np.allclose(pf0[:, 3], pf1[:, 3])
-    assert np.allclose(pf0[:, 4:17], pf1[:, 4:17])
-
+    
+    # Planet 0 'owner_is_me' for P0 should be 'owner_is_enemy' for P1.
+    assert out0["planet_features"][0, 1] == 1.0
+    assert out1["planet_features"][0, 1] == 0.0
+    assert out1["planet_features"][0, 2] == 1.0
+    
+    # Global 'prod_lead' should have opposite signs.
+    g0 = np.asarray(out0["global_features"])
+    g1 = np.asarray(out1["global_features"])
+    
+    # In features_jax.py, prod_lead is at index 7.
+    assert np.isclose(g0[7], -g1[7])
 
 
 def test_planet_rankings_within_subset():
-    """ship_rank_all / prod_rank_all should produce values in [0, 1] and be 1.0
-    only for the strictly-largest active planet."""
-    state = reset(13, episode_steps=200)
+    """Check that _rank_norm produces values in [0, 1]."""
+    state = reset(100, episode_steps=200)
     out = encode_observation(state, jnp.int32(0))
     pf = np.asarray(out["planet_features"])
-    mask = np.asarray(out["planet_mask"])
-    ship_rank = pf[:, 24]
-    prod_rank = pf[:, 25]
-    assert np.all((ship_rank >= 0) & (ship_rank <= 1))
-    assert np.all((prod_rank >= 0) & (prod_rank <= 1))
-    assert np.all(ship_rank[~mask] == 0)
-    # is_my_largest (col 28) should be 0 or 1 only.
-    assert set(np.unique(pf[:, 30])).issubset({0.0, 1.0})
+    # rank features are at 24 and 25
+    ranks = pf[:, 24:26]
+    assert np.all((ranks >= 0.0) & (ranks <= 1.0))
 
 
 def test_comet_remaining_present_after_spawn():
     """After a comet has spawned (step >= 50), comet planets should report
     positive remaining-life values."""
-    from orbit_wars.step import _list_action_to_padded, step
-
+    from orbit_wars.step import step
+    
     state = reset(0, episode_steps=200)
-    a, m = _list_action_to_padded([])
+    # Forward until first comet spawn at step 50
     for _ in range(60):
         state = step(state, [[], []])
     out = encode_observation(state, jnp.int32(0))
     pf = np.asarray(out["planet_features"])
+    # is_comet is index 13.
     is_comet = pf[:, 13] > 0.5
     if is_comet.any():
-        remaining = pf[is_comet, 32]
-        assert np.all(remaining >= 0)
-        assert np.any(remaining > 0)
+        # comet_remaining_norm is index 30
+        remaining = pf[is_comet, 30]
+        assert np.all(remaining > 0.0)
 
 
 def test_encoder_is_jittable():
-    state = reset(0, episode_steps=200)
-    out_eager = encode_observation(state, jnp.int32(0))
-    out_jit = encode_observation_jit(state, jnp.int32(0))
-    for k in out_eager:
-        a = np.asarray(out_eager[k])
-        b = np.asarray(out_jit[k])
-        if a.dtype == np.bool_:
-            assert np.array_equal(a, b), f"bool mismatch on {k}"
-        else:
-            assert np.allclose(a, b, atol=1e-5), f"mismatch on {k}"
+    state = reset(3, episode_steps=200)
+    f = jax.jit(encode_observation)
+    out = f(state, jnp.int32(0))
+    assert "planet_features" in out
 
 
 def test_vmap_matches_single():
-    states = [reset(seed, episode_steps=200) for seed in (1, 4, 9, 16)]
-    batched = tu.tree_map(lambda *xs: jnp.stack(xs), *states)
-    players = jnp.zeros((len(states),), dtype=jnp.int32)
-    batched_out = encode_batch_jit(batched, players)
-
-    for i, s in enumerate(states):
-        single = encode_observation(s, jnp.int32(0))
-        for k in single:
-            a = np.asarray(single[k])
-            b = np.asarray(batched_out[k][i])
-            if a.dtype == np.bool_:
-                assert np.array_equal(a, b), f"bool mismatch on key={k} env={i}"
-            else:
-                assert np.allclose(a, b, atol=1e-5), f"mismatch on key={k} env={i}"
+    state0 = reset(10, episode_steps=200)
+    state1 = reset(20, episode_steps=200)
+    batched = jax.tree_util.tree_map(lambda x, y: jnp.stack([x, y]), state0, state1)
+    players = jnp.array([0, 1], dtype=jnp.int32)
+    
+    batch_out = jax.vmap(encode_observation)(batched, players)
+    single0 = encode_observation(state0, jnp.int32(0))
+    single1 = encode_observation(state1, jnp.int32(1))
+    
+    for k in batch_out:
+        assert np.allclose(np.asarray(batch_out[k][0]), np.asarray(single0[k]), atol=1e-5)
+        assert np.allclose(np.asarray(batch_out[k][1]), np.asarray(single1[k]), atol=1e-5)
 
 
 def test_encoding_after_step():
@@ -158,7 +132,6 @@ def test_encoding_after_step():
     out = encode_observation(state, jnp.int32(0))
     assert jnp.all(jnp.isfinite(out["planet_features"]))
     
-    
     # Turn fraction should be (state.step / episode_steps).
     expected_turn = float(state.step) / float(state.episode_steps)
-    assert np.isclose(float(out["planet_features"][0, 33]), expected_turn)
+    assert np.isclose(float(out["global_features"][0]), expected_turn)

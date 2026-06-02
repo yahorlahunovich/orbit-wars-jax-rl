@@ -134,8 +134,19 @@ class PlanetPolicy(nn.Module):
         diag_mask = jnp.eye(p, dtype=target_logits.dtype)            # (P, P)
         target_logits = target_logits + diag_mask[None, :, :] * self.noop_bias
 
-        # Bucket head: per source planet.
-        bucket_logits = self.bucket_head(planet_h)           # (B, P, BUCKETS)
+        # Bucket head: for every (source, target) pair, score ship buckets.
+        # We concatenate source and target representations to allow the model
+        # to decide ship amounts based on the specific target.
+        h_src = planet_h[:, :, None, :]                       # (B, P, 1, d)
+        h_tgt = planet_h[:, None, :, :]                       # (B, 1, P, d)
+        
+        # Broadcast and concatenate
+        pair_h = jnp.concatenate([
+            jnp.broadcast_to(h_src, (b, p, p, self.d_model)),
+            jnp.broadcast_to(h_tgt, (b, p, p, self.d_model))
+        ], axis=-1)                                          # (B, P, P, 2d)
+        
+        bucket_logits = self.bucket_head(pair_h)             # (B, P, P, BUCKETS)
 
         # Value head from mean pooling over valid planets.
         valid_count = jnp.maximum(jnp.sum(planet_mask, axis=1, keepdims=True), 1.0)
