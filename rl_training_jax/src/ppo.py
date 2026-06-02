@@ -163,12 +163,19 @@ def ppo_loss_fn(
 
     old_log_prob = batch["old_log_prob"]             # (N, P)
     adv_env = batch["advantages"]                    # (N,)
+    
+    # Normalizing advantages per minibatch ensures consistent gradient magnitude.
+    # This is critical for preventing 'timid' updates and very low KL.
+    adv_mean = jnp.mean(adv_env)
+    adv_std = jnp.std(adv_env)
+    adv_norm = (adv_env - adv_mean) / jnp.maximum(adv_std, 1e-8)
+    
     returns_env = batch["returns"]                   # (N,)
     source_valid = batch["source_valid"]             # (N, P)
     mask_f = source_valid.astype(jnp.float32)
     mask_count = jnp.maximum(jnp.sum(mask_f), 1.0)
 
-    adv = adv_env[:, None]                           # (N, 1) — broadcast across sources
+    adv = adv_norm[:, None]                          # (N, 1) — broadcast normalized across sources
     ratio = jnp.exp(new_log_prob - old_log_prob)
     unclipped = ratio * adv
     clipped = jnp.clip(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv
