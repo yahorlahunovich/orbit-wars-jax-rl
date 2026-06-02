@@ -469,7 +469,7 @@ def make_optimizer(cfg: TrainConfig, params):
     total_steps = cfg.lr_total_updates * steps_per_update
 
     def make_schedule(init_lr):
-        return optax.warmup_linear_decay_schedule(
+        return optax.warmup_cosine_decay_schedule(
             init_value=0.0,
             peak_value=init_lr,
             warmup_steps=warmup_steps,
