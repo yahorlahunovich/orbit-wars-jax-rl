@@ -52,15 +52,17 @@ class TrainConfig:
 
     # PPO
     total_updates: int = 5000
-    epochs: int = 3
+    train_pi_iters: int = 80
+    train_v_iters: int = 80
+    target_kl: float = 0.01
     minibatch_size: int = 256
-    gamma: float = 0.9999
-    gae_lambda: float = 0.95
+    gamma: float = 0.99
+    gae_lambda: float = 0.97
     clip_coef: float = 0.2
     ent_coef: float = 0.05  # Increased to fight policy collapse
     vf_coef: float = 0.5
     pi_lr: float = 3e-4
-    vf_lr: float = 4e-4
+    vf_lr: float = 1e-3
     lr_end: float = 1e-6
     lr_warmup_updates: int = 100
     lr_total_updates: int = 1000
@@ -97,15 +99,17 @@ def load_config(path: str | Path) -> TrainConfig:
         bucket_count=int(model.get("bucket_count", 8)),
         weight_decay=float(model.get("weight_decay", 1e-4)),
         total_updates=int(ppo.get("total_updates", 5000)),
-        epochs=int(ppo.get("epochs", 3)),
+        train_pi_iters=int(ppo.get("train_pi_iters", 80)),
+        train_v_iters=int(ppo.get("train_v_iters", 80)),
+        target_kl=float(ppo.get("target_kl", 0.01)),
         minibatch_size=int(ppo.get("minibatch_size", 256)),
-        gamma=float(ppo.get("gamma", 0.9999)),
-        gae_lambda=float(ppo.get("gae_lambda", 0.95)),
+        gamma=float(ppo.get("gamma", 0.99)),
+        gae_lambda=float(ppo.get("gae_lambda", 0.97)),
         clip_coef=float(ppo.get("clip_coef", 0.2)),
         ent_coef=float(ppo.get("ent_coef", 0.05)),
         vf_coef=float(ppo.get("vf_coef", 0.5)),
         pi_lr=float(ppo.get("pi_lr", 3e-4)),
-        vf_lr=float(ppo.get("vf_lr", 4e-4)),
+        vf_lr=float(ppo.get("vf_lr", 1e-3)),
         lr_end=float(ppo.get("lr_end", 1e-6)),
         lr_warmup_updates=int(ppo.get("lr_warmup_updates", 100)),
         lr_total_updates=int(ppo.get("lr_total_updates", 1000)),
@@ -241,10 +245,11 @@ def sample_learner_factory(model: PlanetPolicy, grid_fn):
 
 def _gather_by_player(one_t, zero_t, lp):
     """gather(p0_tensor, p1_tensor, learner_players)."""
-    # lp is (B,) int32
-    return jnp.where(lp[:, None, None], zero_t, one_t) if one_t.ndim == 3 else \
-           jnp.where(lp[:, None], zero_t, one_t) if one_t.ndim == 2 else \
-           jnp.where(lp, zero_t, one_t)
+    # lp is (B,) int32. Expand it to match the rank of one_t.
+    mask = lp
+    for _ in range(one_t.ndim - 1):
+        mask = mask[..., None]
+    return jnp.where(mask, zero_t, one_t)
 
 
 def learner_record_from_samples(
@@ -453,10 +458,12 @@ def maybe_spawn_comets_host(states: OrbitWarsState, cfg: TrainConfig) -> OrbitWa
 
 
 def make_optimizer(cfg: TrainConfig, params):
-    # n_rows = num_envs * rollout_steps
     n_rows = cfg.num_envs * cfg.rollout_steps
     steps_per_epoch = (n_rows + cfg.minibatch_size - 1) // cfg.minibatch_size
-    steps_per_update = cfg.epochs * steps_per_epoch
+    
+    # We estimate total optimizer steps based on the MAX iterations.
+    # Note: policy might early stop, but value usually doesn't.
+    steps_per_update = (cfg.train_pi_iters + cfg.train_v_iters) * steps_per_epoch
     
     warmup_steps = cfg.lr_warmup_updates * steps_per_update
     total_steps = cfg.lr_total_updates * steps_per_update
@@ -473,15 +480,12 @@ def make_optimizer(cfg: TrainConfig, params):
     pi_schedule = make_schedule(cfg.pi_lr)
     vf_schedule = make_schedule(cfg.vf_lr)
 
-    # Label parameters: 'vf' for value_head, 'pi' for everything else.
     def label_fn(path, _):
-        # path is a tuple of strings, e.g. ('params', 'value_head', 'layers_0', 'kernel')
         names = [p.key if hasattr(p, 'key') else str(p) for p in path]
         if 'value_head' in names:
             return 'vf'
         return 'pi'
 
-    # Create multi-optimizer
     labels = jax.tree_util.tree_map_with_path(label_fn, params)
     
     optimizer = optax.multi_transform(
@@ -491,35 +495,47 @@ def make_optimizer(cfg: TrainConfig, params):
         },
         labels
     )
-    
-    # Wrap with global norm clipping
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(cfg.max_grad_norm),
-        optimizer
-    )
-    
+    optimizer = optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optimizer)
     return optimizer, pi_schedule, vf_schedule
 
 
-def init_policy_params(rng, model: PlanetPolicy):
-    example = {
-        "planet_features": jnp.zeros((1, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
-        "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
-    }
-    return model.init(rng, **example), example
-
-
-def make_update_step(model: PlanetPolicy, optimizer, cfg: TrainConfig):
+def make_policy_update_step(model: PlanetPolicy, optimizer, cfg: TrainConfig):
+    from ppo import policy_loss_fn
     @jax.jit
     def update(params, opt_state, batch):
         def loss(p):
-            return ppo_loss_fn(p, model.apply, batch, cfg.clip_coef, cfg.vf_coef, cfg.ent_coef)
-
+            return policy_loss_fn(p, model.apply, batch, cfg.clip_coef, cfg.ent_coef)
         (l, metrics), grads = jax.value_and_grad(loss, has_aux=True)(params)
+        
+        # Zero out value_head grads during policy update
+        def zero_vf_grads(path, g):
+            names = [p.key if hasattr(p, 'key') else str(p) for p in path]
+            return jnp.zeros_like(g) if 'value_head' in names else g
+        grads = jax.tree_util.tree_map_with_path(zero_vf_grads, grads)
+
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, l, metrics
+    return update
 
+
+def make_value_update_step(model: PlanetPolicy, optimizer, cfg: TrainConfig):
+    from ppo import value_loss_fn
+    @jax.jit
+    def update(params, opt_state, batch):
+        def loss(p):
+            return value_loss_fn(p, model.apply, batch)
+        l, grads = jax.value_and_grad(loss)(params)
+        
+        # Zero out policy grads during value update
+        def zero_pi_grads(path, g):
+            names = [p.key if hasattr(p, 'key') else str(p) for p in path]
+            return g if 'value_head' in names else jnp.zeros_like(g)
+        grads = jax.tree_util.tree_map_with_path(zero_pi_grads, grads)
+
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, l
     return update
 
 
@@ -546,7 +562,8 @@ def train(cfg: TrainConfig) -> None:
 
     rollout_selfplay = rollout_step_selfplay_factory(model, grid_fn)
     rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model, grid_fn)
-    update_step = make_update_step(model, optimizer, cfg)
+    policy_update = make_policy_update_step(model, optimizer, cfg)
+    value_update = make_value_update_step(model, optimizer, cfg)
 
     opponent_mode = cfg.opponent.lower()
     if opponent_mode not in ("selfplay", "heuristic", "curriculum"):
@@ -579,7 +596,7 @@ def train(cfg: TrainConfig) -> None:
 
     header = (
         "  update |   mode   | lrnr_wr | W-L-D | episodes | mean_ret | env_sps | "
-        "  loss  | pol_loss | val_loss | entropy |   ev   | approx_kl | clip_fr | pi_lr | vf_lr"
+        "pol_loss | val_loss | entropy |   ev   | approx_kl | clip_fr | pi_lr | vf_lr"
     )
     log_print(header)
     log_print("-" * len(header))
@@ -682,28 +699,51 @@ def train(cfg: TrainConfig) -> None:
 
         n_rows = flat["advantages"].shape[0]
 
-        # ------- PPO update -------
+        # ------- PPO update (Spinning Up style) -------
         t_train = time.perf_counter()
         metrics_accum = {
-            "loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0,
+            "policy_loss": 0.0, "value_loss": 0.0,
             "entropy": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0,
         }
-        opt_steps = 0
-        for _ in range(cfg.epochs):
+        
+        # 1. Policy Training with Early Stopping
+        pi_steps = 0
+        for _ in range(cfg.train_pi_iters):
             perm = np.random.permutation(n_rows)
             for start in range(0, n_rows, cfg.minibatch_size):
                 idx = perm[start : start + cfg.minibatch_size]
                 mb = {k: v[idx] for k, v in flat.items()}
-                params, opt_state, loss_val, m = update_step(params, opt_state, mb)
-                metrics_accum["loss"] += float(loss_val)
-                for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
-                    metrics_accum[k] += float(m[k])
-                opt_steps += 1
+                params, opt_state, _loss, m = policy_update(params, opt_state, mb)
+                
+                metrics_accum["policy_loss"] += float(m["policy_loss"])
+                metrics_accum["entropy"] += float(m["entropy"])
+                metrics_accum["approx_kl"] += float(m["approx_kl"])
+                metrics_accum["clip_fraction"] += float(m["clip_fraction"])
+                pi_steps += 1
+            
+            # Check for early stopping on CPU after each epoch
+            if metrics_accum["approx_kl"] / max(pi_steps, 1) > 1.5 * cfg.target_kl:
+                break
+        
+        if pi_steps > 0:
+            for k in ("policy_loss", "entropy", "approx_kl", "clip_fraction"):
+                metrics_accum[k] /= pi_steps
+
+        # 2. Value Function Fitting
+        v_steps = 0
+        for _ in range(cfg.train_v_iters):
+            perm = np.random.permutation(n_rows)
+            for start in range(0, n_rows, cfg.minibatch_size):
+                idx = perm[start : start + cfg.minibatch_size]
+                mb = {k: v[idx] for k, v in flat.items()}
+                params, opt_state, v_loss = value_update(params, opt_state, mb)
+                metrics_accum["value_loss"] += float(v_loss)
+                v_steps += 1
+        
+        if v_steps > 0:
+            metrics_accum["value_loss"] /= v_steps
 
         train_s = time.perf_counter() - t_train
-        if opt_steps:
-            for k in metrics_accum:
-                metrics_accum[k] /= opt_steps
 
         ev = float(explained_variance(flat["returns"], flat["advantages"] + flat["returns"] - flat["advantages"]))  # ≈ EV(returns, returns) sanity
         # Better: compute new values on (subset of) batch — quick approximation:
@@ -747,7 +787,7 @@ def train(cfg: TrainConfig) -> None:
                 f"{learner_wr:7.1%} | "
                 f"{wld:>5s} | "
                 f"{episodes:7d} | {mean_ret:+.3f} | {env_sps:7.0f} | "
-                f"{metrics_accum['loss']:.4f} | {metrics_accum['policy_loss']:+.4f} | "
+                f"{metrics_accum['policy_loss']:+.4f} | "
                 f"{metrics_accum['value_loss']:.4f} | {metrics_accum['entropy']:.3f} | "
                 f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f} | "
                 f"{plr:.2e} | {vlr:.2e}"

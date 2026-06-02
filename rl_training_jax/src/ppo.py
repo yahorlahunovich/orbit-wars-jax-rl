@@ -1,8 +1,8 @@
 """PPO loss + GAE for the Transformer Orbit Wars policy.
 
 All operations consume the per-source decision rows produced by
-`orbit_wars.rollout.policy_step`. A "row" = one (env, time, source_planet)
-triple. Rows where `source_valid == False` are masked out throughout.
+`orbit_wars.rollout.policy_step`. A \"row\" = one (env, time, source_planet)
+triple. Rows where `executed_mask == False` are masked out throughout.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from orbit_wars.decode import BUCKET_COUNT, compose_action_grid
+from orbit_wars.decode import BUCKET_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -29,9 +29,6 @@ def compute_gae(
     """Generalized Advantage Estimation per env.
 
     Returns `(advantages, returns)` each shaped (B, T).
-
-    Episode resets: when `dones[b, t] == True`, the bootstrap is zeroed at
-    that step so advantages don't leak across episode boundaries.
     """
     not_done = 1.0 - dones.astype(jnp.float32)
 
@@ -80,18 +77,17 @@ def joint_log_prob_and_entropy(
     bucket_idx: jnp.ndarray,            # (N, P) int32
     executed_mask: jnp.ndarray,         # (N, P) bool
 ) -> dict[str, jnp.ndarray]:
-    """Return joint log_prob, per-row entropy contributions, all masked by
-    `executed_mask` so PPO can flatten and average."""
+    """Return joint log_prob, per-row entropy contributions, all masked."""
     tgt_lp = _masked_log_softmax(target_logits, target_has_bucket)        # (N, P, P)
     tgt_lp_sel = jnp.take_along_axis(tgt_lp, target_idx[..., None], axis=-1).squeeze(-1)
     tgt_lp_sel = jnp.where(executed_mask, tgt_lp_sel, 0.0)
 
-    # Per-source entropy of the target distribution (sum over targets).
+    # Per-source entropy of the target distribution.
     tgt_p = jnp.exp(tgt_lp) * target_has_bucket.astype(tgt_lp.dtype)
     entropy_target = -jnp.sum(tgt_p * tgt_lp, axis=-1)                    # (N, P)
     entropy_target = jnp.where(executed_mask, entropy_target, 0.0)
 
-    # Gather bucket logits and validity for the *chosen* target (Point 3).
+    # Gather bucket logits for the *chosen* target.
     b_idx = jnp.arange(target_idx.shape[0])[:, None]
     p_idx = jnp.arange(target_idx.shape[1])[None, :]
     chosen_bucket_logits = bucket_logits[b_idx, p_idx, target_idx]
@@ -117,41 +113,23 @@ def joint_log_prob_and_entropy(
 
 
 # ---------------------------------------------------------------------------
-# PPO loss
+# Separate Policy and Value loss functions (Spinning Up style)
 # ---------------------------------------------------------------------------
 
 
-def ppo_loss_fn(
+def policy_loss_fn(
     params,
     apply_fn,
     batch: dict,
     clip_coef: float,
-    vf_coef: float,
     ent_coef: float,
 ) -> tuple[jnp.ndarray, dict]:
-    """Compute PPO clipped-objective loss + diagnostic metrics.
-
-    Shapes:
-        N = batch rows (env, time) flattened
-        P = MAX_PLANETS source decisions per row
-
-    `batch` must contain:
-        planet_features (N, P, F_p), planet_mask (N, P),
-        fleet_features  (N, F, F_f), fleet_mask  (N, F),
-        global_features (N, F_g)
-            — encoder outputs (recomputed at minibatch time).
-        target_idx, bucket_idx, executed_mask, old_log_prob   (N, P)
-            — chosen actions and per-source validity from rollout time.
-        target_has_bucket (N, P, P) bool, bucket_valid (N, P, P, BUCKETS) bool
-            — frozen action-grid masks captured at rollout time.
-        advantages (N,), returns (N,)
-            — GAE outputs at env-time granularity; broadcast over sources.
-    """
+    """Clipped PPO policy loss + Entropy."""
     out = apply_fn(
         params,
         planet_features=batch["planet_features"],
         planet_mask=batch["planet_mask"],
-    )                                                # value (N,), target_logits (N,P,P), bucket_logits (N,P,P,B)
+    )
 
     info = joint_log_prob_and_entropy(
         target_logits=out.target_logits,
@@ -162,51 +140,57 @@ def ppo_loss_fn(
         bucket_idx=batch["bucket_idx"],
         executed_mask=batch["executed_mask"],
     )
-    new_log_prob = info["log_prob"]                  # (N, P)
-    entropy = info["entropy_target"] + info["entropy_bucket"]   # (N, P)
+    new_log_prob = info["log_prob"]
+    entropy = info["entropy_target"] + info["entropy_bucket"]
 
-    old_log_prob = batch["old_log_prob"]             # (N, P)
-    adv_env = batch["advantages"]                    # (N,)
+    old_log_prob = batch["old_log_prob"]
+    adv_env = batch["advantages"]
     
-    # Normalizing advantages per minibatch ensures consistent gradient magnitude.
-    # This is critical for preventing 'timid' updates and very low KL.
+    # Per-minibatch advantage normalization
     adv_mean = jnp.mean(adv_env)
     adv_std = jnp.std(adv_env)
     adv_norm = (adv_env - adv_mean) / jnp.maximum(adv_std, 1e-8)
     
-    returns_env = batch["returns"]                   # (N,)
-    executed_mask = batch["executed_mask"]           # (N, P)
+    executed_mask = batch["executed_mask"]
     mask_f = executed_mask.astype(jnp.float32)
     mask_count = jnp.maximum(jnp.sum(mask_f), 1.0)
 
-    adv = adv_norm[:, None]                          # (N, 1) — broadcast normalized across sources
+    adv = adv_norm[:, None]
     ratio = jnp.exp(new_log_prob - old_log_prob)
     unclipped = ratio * adv
     clipped = jnp.clip(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv
     policy_loss = -jnp.sum(jnp.minimum(unclipped, clipped) * mask_f) / mask_count
 
-    # Critic: one scalar per env-time row.
-    value_pred = out.value                           # (N,)
-    value_loss = jnp.mean((returns_env - value_pred) ** 2)
-
     entropy_mean = jnp.sum(entropy * mask_f) / mask_count
-
-    total_loss = policy_loss + vf_coef * value_loss - ent_coef * entropy_mean
+    
+    loss = policy_loss - ent_coef * entropy_mean
 
     log_ratio = new_log_prob - old_log_prob
     approx_kl = jnp.sum((ratio - 1.0 - log_ratio) * mask_f) / mask_count
     clip_frac = jnp.sum(((jnp.abs(ratio - 1.0) > clip_coef).astype(jnp.float32)) * mask_f) / mask_count
 
-    return total_loss, {
+    return loss, {
         "policy_loss": policy_loss,
-        "value_loss": value_loss,
         "entropy": entropy_mean,
         "approx_kl": approx_kl,
         "clip_fraction": clip_frac,
     }
 
 
+def value_loss_fn(
+    params,
+    apply_fn,
+    batch: dict,
+) -> jnp.ndarray:
+    """Mean Squared Error value loss."""
+    out = apply_fn(
+        params,
+        planet_features=batch["planet_features"],
+        planet_mask=batch["planet_mask"],
+    )
+    return jnp.mean((batch["returns"] - out.value) ** 2)
+
+
 def explained_variance(returns: jnp.ndarray, values: jnp.ndarray) -> jnp.ndarray:
-    """1 - Var(returns - values) / Var(returns). Returns 0 if returns is constant."""
     var_r = jnp.var(returns)
     return jnp.where(var_r < 1e-8, jnp.float32(0.0), 1.0 - jnp.var(returns - values) / var_r)
