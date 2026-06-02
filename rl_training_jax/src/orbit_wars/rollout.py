@@ -213,8 +213,8 @@ def policy_step(
     encode (done outside) -> policy forward -> sample masked actions -> pack.
 
     Returns a dict containing the action tensor + mask (ready for `step_jit`)
-    and the per-row info PPO needs (`log_prob`, \`entropy\`, \`value\`,
-    \`executed_mask\`).
+    and the per-row info PPO needs (`log_prob`, `entropy`, `value`,
+    `executed_mask`).
     """
     out = policy_apply(params, **features)
     grid = jax.vmap(compose_action_grid, in_axes=(0, 0))(states, player_per_env)

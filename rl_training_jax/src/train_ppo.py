@@ -28,7 +28,7 @@ from orbit_wars import (
     reset,
 )
 from orbit_wars.rollout import pack_padded_actions, sample_actions
-from ppo import compute_gae, explained_variance, ppo_loss_fn
+from ppo import compute_gae, explained_variance
 from policy import PlanetPolicy
 
 
