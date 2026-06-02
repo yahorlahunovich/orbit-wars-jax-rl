@@ -539,6 +539,14 @@ def make_value_update_step(model: PlanetPolicy, optimizer, cfg: TrainConfig):
     return update
 
 
+def init_policy_params(rng, model: PlanetPolicy):
+    example = {
+        "planet_features": jnp.zeros((1, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
+        "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
+    }
+    return model.init(rng, **example), example
+
+
 def train(cfg: TrainConfig) -> None:
     rng = jax.random.PRNGKey(cfg.seed)
     rng, init_rng = jax.random.split(rng)
@@ -605,7 +613,7 @@ def train(cfg: TrainConfig) -> None:
     
     n_rows_full = cfg.num_envs * cfg.rollout_steps
     steps_per_epoch = (n_rows_full + cfg.minibatch_size - 1) // cfg.minibatch_size
-    steps_per_update = cfg.epochs * steps_per_epoch
+    steps_per_update = (cfg.train_pi_iters + cfg.train_v_iters) * steps_per_epoch
 
     for update_idx in range(1, cfg.total_updates + 1):
         # ------- Rollout -------
@@ -777,7 +785,6 @@ def train(cfg: TrainConfig) -> None:
 
         if update_idx % cfg.log_every == 0:
             # Get current LR values from schedules
-            # current step for schedule = update_idx * steps_per_update
             cur_step = update_idx * steps_per_update
             plr = float(pi_sched(cur_step))
             vlr = float(vf_sched(cur_step))
@@ -811,7 +818,7 @@ def train(cfg: TrainConfig) -> None:
             opponent_mode == "curriculum"
             and active_mode == "heuristic"
             and not curriculum_switched
-            and len(window) >= cfg.heuristic_window_episodes
+            and len(display_window) >= cfg.heuristic_window_episodes
             and learner_wr >= cfg.heuristic_win_rate
         ):
             active_mode = "selfplay"
