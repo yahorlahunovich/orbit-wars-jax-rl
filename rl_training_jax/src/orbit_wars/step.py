@@ -487,7 +487,12 @@ def _termination(state: OrbitWarsState) -> OrbitWarsState:
         ),
         jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32),
     )
-    return state.replace(done=terminated, rewards=rewards)
+
+    # Intermediate reward shaping: tiny bonus per planet owned.
+    # Encourages early game expansion.
+    step_rewards = jnp.sum(owned_match.astype(jnp.float32), axis=-1) * 0.01
+
+    return state.replace(done=terminated, rewards=rewards, step_rewards=step_rewards)
 
 
 # ---------------------------------------------------------------------------

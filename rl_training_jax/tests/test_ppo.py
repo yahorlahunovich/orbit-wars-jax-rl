@@ -56,15 +56,6 @@ def test_gae_done_resets_bootstrap():
     next_value = jnp.zeros((1,), dtype=jnp.float32)
     adv, _ = compute_gae(rewards, values, dones, next_value, gamma=1.0, lam=1.0)
     a = np.asarray(adv)
-    # Step 0 sees reward at step 1, but step 1 ends → step 0 advantage = 0 + 1 (reward) + 0 (next * 0 because done) = wait
-    # delta_t = r_t + gamma * V_{t+1} * (1-done_t) - V_t
-    # delta_0 = 0 + 1*0*1 - 0 = 0
-    # delta_1 = 1 + 1*0*0 - 0 = 1   (done_1=True so next_v killed)
-    # delta_2 = 0; delta_3 = 0
-    # gae_3 = 0
-    # gae_2 = 0 + 1*1*1*0 = 0
-    # gae_1 = 1 + 1*1*0*0 = 1
-    # gae_0 = 0 + 1*1*1*1 = 1
     assert np.isclose(a[0, 1], 1.0)
     assert np.isclose(a[0, 2], 0.0)
     assert np.isclose(a[0, 3], 0.0)
@@ -94,12 +85,15 @@ def test_ppo_loss_runs_and_decreases_with_better_policy():
     example = {
         "planet_features": jnp.ones((N, P, PLANET_FEATURE_DIM), jnp.float32) * 0.1,
         "planet_mask": jnp.ones((N, P), jnp.bool_),
+        "fleet_features": jnp.zeros((N, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
+        "fleet_mask": jnp.zeros((N, MAX_FLEETS), jnp.bool_),
+        "global_features": jnp.zeros((N, GLOBAL_FEATURE_DIM), jnp.float32),
     }
     params = model.init(rng, **example)
 
     target_has_bucket = jnp.ones((N, P, P), jnp.bool_)
     bucket_valid = jnp.ones((N, P, P, BUCKET_COUNT), jnp.bool_)
-    source_valid = jnp.zeros((N, P), jnp.bool_).at[:, :3].set(True)
+    executed_mask = jnp.zeros((N, P), jnp.bool_).at[:, :3].set(True)
     target_idx = jnp.zeros((N, P), jnp.int32).at[:, :3].set(1)
     bucket_idx = jnp.zeros((N, P), jnp.int32)
     old_log_prob = jnp.zeros((N, P), jnp.float32)
@@ -110,7 +104,7 @@ def test_ppo_loss_runs_and_decreases_with_better_policy():
         **example,
         "target_has_bucket": target_has_bucket,
         "bucket_valid": bucket_valid,
-        "source_valid": source_valid,
+        "executed_mask": executed_mask,
         "target_idx": target_idx,
         "bucket_idx": bucket_idx,
         "old_log_prob": old_log_prob,

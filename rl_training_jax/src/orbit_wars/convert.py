@@ -103,6 +103,7 @@ def observation_to_state(
     episode_steps: int = 500,
     done: bool = False,
     rewards: tuple[float, float] = (0.0, 0.0),
+    step_rewards: tuple[float, float] = (0.0, 0.0),
 ) -> OrbitWarsState:
     base = empty_state()
     planet_pad = np.zeros((MAX_PLANETS, PLANET_COLS), dtype=np.float32)
@@ -129,6 +130,7 @@ def observation_to_state(
         episode_seed=jnp.int32(int(episode_seed)),
         done=jnp.bool_(done),
         rewards=jnp.asarray(rewards, dtype=jnp.float32),
+        step_rewards=jnp.asarray(step_rewards, dtype=jnp.float32),
         ship_speed=jnp.float32(float(ship_speed)),
         episode_steps=jnp.int32(int(episode_steps)),
     )
@@ -221,6 +223,7 @@ def state_to_observation_dict(state: OrbitWarsState, *, player: int = 0) -> dict
                 episode_seed=state.episode_seed,
                 done=state.done,
                 rewards=state.rewards,
+                step_rewards=state.step_rewards,
                 ship_speed=state.ship_speed,
                 episode_steps=state.episode_steps,
             )

@@ -43,7 +43,8 @@ class OrbitWarsState:
     next_fleet_id: jnp.int32
     episode_seed: jnp.int32
     done: jnp.bool_
-    rewards: jnp.ndarray  # (NUM_PLAYERS,) float32
+    rewards: jnp.ndarray  # (NUM_PLAYERS,) float32 terminal
+    step_rewards: jnp.ndarray  # (NUM_PLAYERS,) float32 shaping
     ship_speed: jnp.float32
     episode_steps: jnp.int32
 
@@ -74,6 +75,7 @@ def empty_state() -> OrbitWarsState:
         episode_seed=jnp.int32(0),
         done=jnp.bool_(False),
         rewards=jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32),
+        step_rewards=jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32),
         ship_speed=jnp.float32(DEFAULT_SHIP_SPEED),
         episode_steps=jnp.int32(DEFAULT_EPISODE_STEPS),
     )
