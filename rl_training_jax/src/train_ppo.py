@@ -705,8 +705,18 @@ def train(cfg: TrainConfig) -> None:
         mean_ret = float(np.mean(finished_returns_window[-50:])) if finished_returns_window else float("nan")
         episodes = len(finished_returns_window)
 
-        window = heuristic_returns_window[-cfg.heuristic_window_episodes :]
-        learner_wr = float(np.mean([1.0 if r > 0 else 0.0 for r in window])) if window else float("nan")
+        # Calculate winrates for the dual thresholds (100 and 200 games)
+        # Note: heuristic_returns_window is cleared every time the opponent updates.
+        win_100 = heuristic_returns_window[-100:]
+        wr_100 = float(np.mean([1.0 if r > 0 else 0.0 for r in win_100])) if len(win_100) >= 100 else float("nan")
+        
+        win_200 = heuristic_returns_window[-200:]
+        wr_200 = float(np.mean([1.0 if r > 0 else 0.0 for r in win_200])) if len(win_200) >= 200 else float("nan")
+        
+        # Display winrate against current opponent in logs (using largest available window up to 100)
+        display_window = heuristic_returns_window[-100:]
+        learner_wr = float(np.mean([1.0 if r > 0 else 0.0 for r in display_window])) if display_window else float("nan")
+        
         wld = f"{learner_wins}-{learner_losses}-{learner_draws}"
 
         if update_idx % cfg.log_every == 0:
@@ -721,8 +731,16 @@ def train(cfg: TrainConfig) -> None:
             )
             learner_wins = learner_losses = learner_draws = 0
 
-        if active_mode == "selfplay" and len(window) >= cfg.heuristic_window_episodes and learner_wr >= 0.54:
-            log_print(f"Update {update_idx}: Self-play winrate {learner_wr:.1%} >= 54.0%. Updating opponent parameters.")
+        update_opp = False
+        if active_mode == "selfplay":
+            if not np.isnan(wr_100) and wr_100 > 0.54:
+                log_print(f"Update {update_idx}: Self-play winrate {wr_100:.1%} > 54% (100 games). Updating opponent parameters.")
+                update_opp = True
+            elif not np.isnan(wr_200) and wr_200 > 0.56:
+                log_print(f"Update {update_idx}: Self-play winrate {wr_200:.1%} > 56% (200 games). Updating opponent parameters.")
+                update_opp = True
+        
+        if update_opp:
             opp_params = params
             heuristic_returns_window.clear()
 
