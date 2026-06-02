@@ -140,16 +140,6 @@ def path_blocked_by_planets(
     tx = target_x[:, :, None]
     ty = target_y[:, :, None]
 
-    # Optimization: Bounding box check before expensive point-to-segment distance.
-    # An obstacle can only block the path if it is within the segment's bounding box.
-    x_min = jnp.minimum(sx, tx) - obs_r
-    x_max = jnp.maximum(sx, tx) + obs_r
-    y_min = jnp.minimum(sy, ty) - obs_r
-    y_max = jnp.maximum(sy, ty) + obs_r
-    
-    in_box = (ox >= x_min) & (ox <= x_max) & (oy >= y_min) & (oy <= y_max)
-    is_obstacle = is_obstacle & in_box
-
     d = point_to_segment_distance(ox, oy, sx, sy, tx, ty)
     return jnp.any((d <= obs_r) & is_obstacle, axis=2)
 

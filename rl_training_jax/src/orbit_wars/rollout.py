@@ -105,16 +105,11 @@ def sample_actions(
     tgt_lp = jnp.where(source_valid, tgt_lp, jnp.float32(0.0))
 
     # Bucket distribution conditional on the chosen target.
-    # Index into the (B, P, P, BUCKETS) bucket_logits using target_idx.
-    b_idx = jnp.arange(b)[:, None]
-    p_idx = jnp.arange(p)[None, :]
-    chosen_bucket_logits = bucket_logits[b_idx, p_idx, target_idx] # (B, P, BUCKETS)
-
     # Gather full_valid[b, s, target_idx[b, s], :] -> (B, P, BUCKETS)
     chosen_bucket_valid = jnp.take_along_axis(
         full_valid, target_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
     ).squeeze(2)                                                # (B, P, BUCKETS)
-    bucket_lp_row = _masked_log_softmax(chosen_bucket_logits, chosen_bucket_valid)
+    bucket_lp_row = _masked_log_softmax(bucket_logits, chosen_bucket_valid)
     entropy_bucket = _entropy_from_log_probs(bucket_lp_row, chosen_bucket_valid)
 
     rng, k_bkt = jax.random.split(rng)
@@ -190,13 +185,7 @@ def pack_padded_actions(
 
     actions = rows_sorted[:, :MAX_MOVES_PER_PLAYER, :]
     action_mask = mask_sorted[:, :MAX_MOVES_PER_PLAYER]
-
-    # Truncation fix (Point 5): identify which sources actually "made the cut".
-    # PPO should only learn from actions that were not truncated.
-    rank = jnp.argsort(sort_idx, axis=-1)                       # (B, P) — rank of each source in sorted list
-    executed_mask = source_valid & (rank < MAX_MOVES_PER_PLAYER) & (~is_noop)
-
-    return actions, action_mask, executed_mask
+    return actions, action_mask
 
 
 def policy_step(
@@ -214,14 +203,14 @@ def policy_step(
 
     Returns a dict containing the action tensor + mask (ready for `step_jit`)
     and the per-row info PPO needs (`log_prob`, `entropy`, `value`,
-    `executed_mask`).
+    `source_valid`).
     """
     out = policy_apply(params, **features)
     grid = jax.vmap(compose_action_grid, in_axes=(0, 0))(states, player_per_env)
     sampled = sample_actions(
         rng, out.target_logits, out.bucket_logits, grid, deterministic=deterministic
     )
-    actions, action_mask, executed_mask = pack_padded_actions(
+    actions, action_mask = pack_padded_actions(
         sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
     )
     return {
@@ -232,6 +221,6 @@ def policy_step(
         "log_prob": sampled["log_prob"],
         "entropy_target": sampled["entropy_target"],
         "entropy_bucket": sampled["entropy_bucket"],
-        "executed_mask": executed_mask,              # (B, P) — for PPO (fixes truncation bias)
+        "source_valid": sampled["source_valid"],
         "value": out.value,                          # (B,)
     }

@@ -239,13 +239,13 @@ def sample_both_players_factory(model: PlanetPolicy, grid_fn):
 
         grid0 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(0))
         s0 = sample_actions(k0, out0.target_logits, out0.bucket_logits, grid0)
-        a0, m0, em0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
+        a0, m0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
 
         grid1 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(1))
         s1 = sample_actions(k1, out1.target_logits, out1.bucket_logits, grid1)
-        a1, m1, em1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
+        a1, m1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
         
-        return (a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, rng)
+        return (a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, rng)
 
     return sample
 
@@ -260,10 +260,10 @@ def sample_learner_factory(model: PlanetPolicy, grid_fn):
         out = model.apply(params, **feats)
         grid = jax.vmap(grid_fn, in_axes=(0, 0))(states, learner_players)
         sampled = sample_actions(k0, out.target_logits, out.bucket_logits, grid)
-        actions, mask, executed_mask = pack_padded_actions(
-            sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
+        actions, mask = pack_padded_actions(
+            sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid,
         )
-        return actions, mask, executed_mask, sampled, out, grid, feats, rng
+        return actions, mask, sampled, out, grid, feats, rng
 
     return sample
 
@@ -278,8 +278,6 @@ def learner_record_from_samples(
     grid1,
     feats0,
     feats1,
-    em0,
-    em1,
     new_states: OrbitWarsState,
 ) -> dict:
     learner_feats = jax.tree_util.tree_map(
@@ -289,7 +287,7 @@ def learner_record_from_samples(
     target_idx = _gather_by_player(s0["target_idx"], s1["target_idx"], learner_players)
     bucket_idx = _gather_by_player(s0["bucket_idx"], s1["bucket_idx"], learner_players)
     log_prob = _gather_by_player(s0["log_prob"], s1["log_prob"], learner_players)
-    executed_mask = _gather_by_player(em0, em1, learner_players)
+    source_valid = _gather_by_player(s0["source_valid"], s1["source_valid"], learner_players)
     target_has_bucket = _gather_by_player(
         jnp.any(grid0["full_valid"], axis=-1),
         jnp.any(grid1["full_valid"], axis=-1),
@@ -306,11 +304,6 @@ def learner_record_from_samples(
             jnp.zeros_like(new_states.rewards[:, 0]),
         ),
     )
-    
-    # Combined reward for GAE: terminal + shaping
-    step_reward_raw = _gather_by_player(new_states.step_rewards[:, 0], new_states.step_rewards[:, 1], learner_players)
-    total_reward = reward + step_reward_raw
-
     opp_reward = jnp.where(
         new_states.done & (learner_players == 0),
         new_states.rewards[:, 1],
@@ -323,19 +316,15 @@ def learner_record_from_samples(
     return {
         "planet_features": learner_feats["planet_features"],
         "planet_mask": learner_feats["planet_mask"],
-        "fleet_features": learner_feats["fleet_features"],
-        "fleet_mask": learner_feats["fleet_mask"],
-        "global_features": learner_feats["global_features"],
 
         "target_idx": target_idx,
         "bucket_idx": bucket_idx,
         "log_prob": log_prob,
-        "executed_mask": executed_mask,
+        "source_valid": source_valid,
         "target_has_bucket": target_has_bucket,
         "bucket_valid": bucket_valid,
         "value": learner_value,
-        "reward": total_reward,
-        "terminal_reward": reward,
+        "reward": reward,
         "opp_reward": opp_reward,
         "done": new_states.done,
     }
@@ -347,7 +336,6 @@ def learner_record_from_single(
     out,
     grid,
     feats,
-    executed_mask,
     new_states: OrbitWarsState,
 ) -> dict:
     target_has_bucket = jnp.any(grid["full_valid"], axis=-1)
@@ -361,25 +349,18 @@ def learner_record_from_single(
 
     reward = jnp.where(new_states.done, reward, jnp.zeros_like(reward))
     opp_reward = jnp.where(new_states.done, opp_reward, jnp.zeros_like(opp_reward))
-    
-    step_reward_raw = new_states.step_rewards[batch, lp]
-    total_reward = reward + step_reward_raw
 
     return {
         "planet_features": feats["planet_features"],
         "planet_mask": feats["planet_mask"],
-        "fleet_features": feats["fleet_features"],
-        "fleet_mask": feats["fleet_mask"],
-        "global_features": feats["global_features"],
         "target_idx": sampled["target_idx"],
         "bucket_idx": sampled["bucket_idx"],
         "log_prob": sampled["log_prob"],
-        "executed_mask": executed_mask,
+        "source_valid": sampled["source_valid"],
         "target_has_bucket": target_has_bucket,
         "bucket_valid": bucket_valid,
         "value": out.value,
-        "reward": total_reward,
-        "terminal_reward": reward,
+        "reward": reward,
         "opp_reward": opp_reward,
         "done": new_states.done,
     }
@@ -392,12 +373,12 @@ def rollout_step_selfplay_factory(model: PlanetPolicy, grid_fn):
     @jax.jit
     def step_one(states: OrbitWarsState, params, opp_params, rng, learner_players, reset_pool):
         rng, k_sample, k_pool, k_lp = jax.random.split(rng, 4)
-        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, k_sample = sample(
+        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, k_sample = sample(
             states, params, opp_params, k_sample, learner_players
         )
         new_states = jax.vmap(step_jit)(states, a0, a1, m0, m1)
         record = learner_record_from_samples(
-            learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, new_states,
+            learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, new_states,
         )
         
         dones = new_states.done
@@ -435,7 +416,7 @@ def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
         opponent_players_np: np.ndarray,
         heuristic_agent,
     ):
-        actions, mask, executed_mask, sampled, out, grid, feats, rng = sample(states, params, rng, learner_players)
+        actions, mask, sampled, out, grid, feats, rng = sample(states, params, rng, learner_players)
         ha0, hm0, ha1, hm1 = batched_heuristic_actions(states, opponent_players_np, heuristic_agent)
 
         is_learner_p0 = (learner_players == 0)
@@ -443,11 +424,11 @@ def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
         final_a1 = jnp.where(is_learner_p0[:, None, None], ha1, actions)
         final_m0 = jnp.where(is_learner_p0[:, None], mask, hm0)
         final_m1 = jnp.where(is_learner_p0[:, None], hm1, mask)
-new_states = jax.vmap(step_jit)(states, final_a0, final_a1, final_m0, final_m1)
-record = learner_record_from_single(
-    learner_players, sampled, out, grid, feats, executed_mask, new_states,
-)
-return new_states, record, rng
+
+        new_states = jax.vmap(step_jit)(states, final_a0, final_a1, final_m0, final_m1)
+        record = learner_record_from_single(learner_players, sampled, out, grid, feats, new_states)
+        return new_states, record, rng
+
     return step_one
 
 
@@ -492,9 +473,6 @@ def init_policy_params(rng, model: PlanetPolicy):
     example = {
         "planet_features": jnp.zeros((1, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((1, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((1, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.ones((1, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((1, GLOBAL_FEATURE_DIM), jnp.float32),
     }
     return model.init(rng, **example), example
 
@@ -673,9 +651,7 @@ def train(cfg: TrainConfig) -> None:
         flat = {}
         for k in (
             "planet_features", "planet_mask",
-            "fleet_features", "fleet_mask",
-            "global_features",
-            "target_idx", "bucket_idx", "log_prob", "executed_mask",
+            "target_idx", "bucket_idx", "log_prob", "source_valid",
             "target_has_bucket", "bucket_valid",
         ):
             flat[k] = flatten(stack_t(k, rollout_records))
@@ -715,8 +691,6 @@ def train(cfg: TrainConfig) -> None:
         v_sub = model.apply(
             params,
             planet_features=sub["planet_features"], planet_mask=sub["planet_mask"],
-            fleet_features=sub["fleet_features"], fleet_mask=sub["fleet_mask"],
-            global_features=sub["global_features"],
         ).value
         ev = float(explained_variance(sub["returns"], v_sub))
 

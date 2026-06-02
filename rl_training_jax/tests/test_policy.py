@@ -24,9 +24,6 @@ def _example_batch(batch: int = 2):
     return {
         "planet_features": jnp.zeros((batch, MAX_PLANETS, PLANET_FEATURE_DIM), jnp.float32),
         "planet_mask": jnp.ones((batch, MAX_PLANETS), jnp.bool_),
-        "fleet_features": jnp.zeros((batch, MAX_FLEETS, FLEET_FEATURE_DIM), jnp.float32),
-        "fleet_mask": jnp.ones((batch, MAX_FLEETS), jnp.bool_),
-        "global_features": jnp.zeros((batch, GLOBAL_FEATURE_DIM), jnp.float32),
     }
 
 
@@ -37,7 +34,7 @@ def test_policy_forward_shapes():
     params = init_policy(rng, model, example)
     out = model.apply(params, **example)
     assert out.target_logits.shape == (3, MAX_PLANETS, MAX_PLANETS)
-    assert out.bucket_logits.shape == (3, MAX_PLANETS, MAX_PLANETS, 8)
+    assert out.bucket_logits.shape == (3, MAX_PLANETS, 8)
     assert out.value.shape == (3,)
     assert jnp.isfinite(out.target_logits).all()
     assert jnp.isfinite(out.bucket_logits).all()
@@ -117,8 +114,8 @@ def test_padding_does_not_affect_active_outputs():
         atol=1e-5,
     )
     assert np.allclose(
-        np.asarray(out_a.bucket_logits[:, :10, :10, :]),
-        np.asarray(out_b.bucket_logits[:, :10, :10, :]),
+        np.asarray(out_a.bucket_logits[:, :10, :]),
+        np.asarray(out_b.bucket_logits[:, :10, :]),
         atol=1e-5,
     )
     assert np.allclose(np.asarray(out_a.value), np.asarray(out_b.value), atol=1e-5)

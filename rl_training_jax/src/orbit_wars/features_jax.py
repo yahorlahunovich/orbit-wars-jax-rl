@@ -3,11 +3,12 @@
 This module converts an `OrbitWarsState` (or a batched `vmap` thereof) into
 fixed-shape entity-level features:
 
-- planet features:  (B, MAX_PLANETS, PLANET_FEATURE_DIM)  plus planet_mask  (B, MAX_PLANETS)
-- fleet  features:  (B, MAX_FLEETS,  FLEET_FEATURE_DIM)   plus fleet_mask   (B, MAX_FLEETS)
-- global features:  (B, GLOBAL_FEATURE_DIM)
+- planet features:  (B, MAX_PLANETS, F_PLANET)        plus planet_mask  (B, MAX_PLANETS)
+- fleet  features:  (B, MAX_FLEETS,  F_FLEET)         plus fleet_mask   (B, MAX_FLEETS)
+- global features:  (B, F_GLOBAL)
 
-All features are player-relative (perspective of `player`).
+All features are player-relative (perspective of `player`) — owner flags, lead
+ratios, etc. are flipped automatically for the opposite side.
 
 The encoder is JIT-friendly and vmappable. No NumPy bridge.
 """
@@ -21,15 +22,17 @@ from .constants import (
     BOARD_SIZE,
     CENTER,
     COMET_SPAWN_STEPS,
+    DEFAULT_SHIP_SPEED,
     MAX_COMET_GROUPS,
     MAX_FLEETS,
     MAX_PLANETS,
     ROTATION_RADIUS_LIMIT,
+    SUN_RADIUS,
 )
 from .geometry import fleet_speed
 from .state import OrbitWarsState
 
-PLANET_FEATURE_DIM = 31
+PLANET_FEATURE_DIM = 55
 FLEET_FEATURE_DIM = 15
 GLOBAL_FEATURE_DIM = 22
 
@@ -39,6 +42,7 @@ FLEET_SHIPS_LOG_DENOM = jnp.log1p(jnp.float32(500.0))
 PRODUCTION_DENOM = jnp.float32(5.0)
 RADIUS_DENOM = jnp.float32(10.0)
 DIST_DENOM = jnp.float32(50.0)
+INCOMING_PERP_TOL = jnp.float32(3.0)  # how close a fleet's path must come to a planet to count as "incoming"
 
 
 def _ships_log_norm(ships: jnp.ndarray) -> jnp.ndarray:
@@ -141,22 +145,31 @@ def _nearest_distance_to_subset(
     planets: jnp.ndarray,
     subset_mask: jnp.ndarray,
 ) -> jnp.ndarray:
-    """For each planet, distance to the nearest other planet in `subset_mask`."""
+    """For each planet, distance to the nearest other planet in `subset_mask`.
+
+    Returns DIST_DENOM if the subset is empty.
+    """
     x = planets[:, 2]
     y = planets[:, 3]
     dx = x[:, None] - x[None, :]
     dy = y[:, None] - y[None, :]
     dist = jnp.sqrt(dx * dx + dy * dy)
     big = jnp.float32(1e6)
+    # Exclude self and rows outside the subset.
     self_mask = jnp.eye(MAX_PLANETS, dtype=jnp.bool_)
     masked = jnp.where(subset_mask[None, :] & (~self_mask), dist, big)
     nearest = jnp.min(masked, axis=-1)
+    # Convert "no subset member" sentinel (big) to a finite max distance.
     nearest = jnp.where(nearest >= big, DIST_DENOM * 3.0, nearest)
     return nearest
 
 
 def _rank_norm(values: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    """Rank normalization in [0, 1]."""
+    """For each entry, fraction of *masked* entries with a strictly smaller value.
+
+    For inactive entries (`~mask`) returns 0. Output in `[0, 1]`. 1.0 means
+    "largest in the masked set"; 0.0 means "smallest in the masked set".
+    """
     eligible_count = jnp.sum(mask.astype(jnp.float32))
     smaller = jnp.sum(
         (values[:, None] > values[None, :])
@@ -169,22 +182,34 @@ def _rank_norm(values: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
 
 
 def _comet_remaining_life(state: OrbitWarsState) -> jnp.ndarray:
-    """Remaining comet path steps scattered to planet slots."""
+    """For each planet slot, remaining comet path steps (else 0).
+
+    Vectorized: for each (g, q) comet quad, scatter remaining = path_length -
+    (path_index + 1) into the planet slot whose id matches.
+    """
     comets = state.comets
     cgpids = comets.planet_ids
     cplens = comets.path_lengths
     cactive = comets.active
     idx_next = comets.path_index + 1
+
     pids = state.planets[:, 0].astype(jnp.int32)
     active = state.planets[:, 7] > 0.0
-    match_gqp = (cgpids[..., None] == pids[None, None, :]) & active[None, None, :] & (cgpids[..., None] >= 0)
+
+    match_gqp = (
+        (cgpids[..., None] == pids[None, None, :])
+        & active[None, None, :]
+        & (cgpids[..., None] >= 0)
+    )                                                # (G, 4, P)
     slot_gq = jnp.argmax(match_gqp.astype(jnp.int32), axis=-1)
     has_match_gq = jnp.any(match_gqp, axis=-1)
     remaining_gq = (cplens - idx_next[:, None]).astype(jnp.float32)
+    remaining_gq = jnp.maximum(remaining_gq, 0.0)
     valid_gq = has_match_gq & cactive[:, None] & (cgpids >= 0)
+
     out = jnp.zeros((MAX_PLANETS,), dtype=jnp.float32)
     flat_slot = slot_gq.reshape(-1)
-    flat_val = jnp.where(valid_gq.reshape(-1), jnp.maximum(remaining_gq.reshape(-1), 0.0), 0.0)
+    flat_val = jnp.where(valid_gq.reshape(-1), remaining_gq.reshape(-1), 0.0)
     out = out.at[flat_slot].set(jnp.maximum(out[flat_slot], flat_val))
     return out
 
@@ -193,7 +218,14 @@ def encode_observation(
     state: OrbitWarsState,
     player: jnp.int32 | int,
 ) -> dict[str, jnp.ndarray]:
-    """Full entity-level encoder."""
+    """Encode a single (unbatched) state into entity features for `player`.
+
+    Returns a dict with keys:
+        planet_features (P, F_PLANET) float32
+        planet_mask     (P,)           bool
+
+    Apply `jax.vmap(encode_observation, in_axes=(0, None))` for batched envs.
+    """
     player_f = jnp.float32(player)
     planets = state.planets
     fleets = state.fleets
@@ -258,19 +290,40 @@ def encode_observation(
     comet_remaining = _comet_remaining_life(state)
     comet_remaining_norm = comet_remaining / jnp.float32(64.0)
 
-    # ---------------- Global features --------------------------------------
+    # Global variables computation
     my_planet_count = jnp.sum(owner_is_me.astype(jnp.float32))
     enemy_planet_count = jnp.sum(owner_is_enemy.astype(jnp.float32))
     neutral_planet_count = jnp.sum(owner_is_neutral.astype(jnp.float32))
+
     my_prod = jnp.sum(jnp.where(owner_is_me, production, 0.0))
     enemy_prod = jnp.sum(jnp.where(owner_is_enemy, production, 0.0))
-    my_ships_total = jnp.sum(jnp.where(owner_is_me, ships, 0.0))
-    enemy_ships_total = jnp.sum(jnp.where(owner_is_enemy, ships, 0.0))
+
+    my_ships = jnp.sum(jnp.where(owner_is_me, ships, 0.0))
+    enemy_ships = jnp.sum(jnp.where(owner_is_enemy, ships, 0.0))
+
     prod_lead = (my_prod - enemy_prod) / (my_prod + enemy_prod + 1.0)
-    ship_lead = (my_ships_total - enemy_ships_total) / (my_ships_total + enemy_ships_total + 1.0)
+    ship_lead = (my_ships - enemy_ships) / (my_ships + enemy_ships + 1.0)
+
     active_comets = jnp.sum(state.comets.active.astype(jnp.float32))
+
+    fleet_owner = fleets[:, 1]
+    fleet_ships = fleets[:, 6]
+    fleet_active = fleets[:, 7] > 0.0
+    f_is_me = fleet_active & (fleet_owner == player_f)
+    f_is_enemy = fleet_active & (fleet_owner >= 0.0) & (fleet_owner != player_f)
+
+    my_fleet_ships = jnp.sum(jnp.where(f_is_me, fleet_ships, 0.0))
+    enemy_fleet_ships = jnp.sum(jnp.where(f_is_enemy, fleet_ships, 0.0))
+    my_fleet_count = jnp.sum(f_is_me.astype(jnp.float32))
+    enemy_fleet_count = jnp.sum(f_is_enemy.astype(jnp.float32))
+
     turn = state.step.astype(jnp.float32) / jnp.maximum(state.episode_steps.astype(jnp.float32), 1.0)
-    
+
+    my_largest_ships = jnp.max(jnp.where(owner_is_me, ships, 0.0))
+    enemy_largest_ships = jnp.max(jnp.where(owner_is_enemy, ships, 0.0))
+    my_largest_prod = jnp.max(jnp.where(owner_is_me, production, 0.0))
+    enemy_largest_prod = jnp.max(jnp.where(owner_is_enemy, production, 0.0))
+
     cur_step = state.step.astype(jnp.float32)
     ep = jnp.maximum(state.episode_steps.astype(jnp.float32), 1.0)
     spawn_arr = jnp.asarray(COMET_SPAWN_STEPS, dtype=jnp.float32)
@@ -278,55 +331,84 @@ def encode_observation(
     delta = jnp.where(delta > 0.0, delta, ep)
     next_comet_in = jnp.min(delta) / ep
 
-    global_features = jnp.stack([
-        turn, 1.0 - turn,
-        my_planet_count / MAX_PLANETS, enemy_planet_count / MAX_PLANETS, neutral_planet_count / MAX_PLANETS,
-        my_prod / 50.0, enemy_prod / 50.0,
-        prod_lead, ship_lead,
-        active_comets / 3.0, next_comet_in
-    ], axis=-1)
-    # Pad to GLOBAL_FEATURE_DIM if needed, here it's 11.
-    global_features = jnp.pad(global_features, (0, GLOBAL_FEATURE_DIM - global_features.shape[0]))
+    is_late_game = (turn > jnp.float32(0.5)).astype(jnp.float32)
 
-    planet_features = jnp.stack([
-        active.astype(jnp.float32), owner_is_me.astype(jnp.float32), owner_is_enemy.astype(jnp.float32), owner_is_neutral.astype(jnp.float32),
-        _ships_log_norm(ships), production / PRODUCTION_DENOM, radius / RADIUS_DENOM, x / BOARD_SIZE, y / BOARD_SIZE,
-        dx_c, dy_c, dist_c, is_orbiting.astype(jnp.float32), is_comet.astype(jnp.float32), orbit_r_norm, orbit_angle_sin, orbit_angle_cos,
-        _ships_log_norm(incoming_me), _ships_log_norm(incoming_enemy), eta_me_norm, eta_enemy_norm, roi_norm, is_high_value,
-        nearest_enemy_d - nearest_friend_d, ship_rank_all, prod_rank_all, net_balance_signed_log, would_lose.astype(jnp.float32),
-        time_to_nearest_enemy, time_to_nearest_neutral, comet_remaining_norm
-    ], axis=-1)
+    planet_features = jnp.stack(
+        [
+            active.astype(jnp.float32),                              # 0
+            owner_is_me.astype(jnp.float32),                         # 1
+            owner_is_enemy.astype(jnp.float32),                      # 2
+            owner_is_neutral.astype(jnp.float32),                    # 3
+            _ships_log_norm(ships),                                  # 4
+            production / PRODUCTION_DENOM,                           # 5
+            radius / RADIUS_DENOM,                                   # 6
+            x / BOARD_SIZE,                                          # 7
+            y / BOARD_SIZE,                                          # 8
+            dx_c,                                                    # 9
+            dy_c,                                                    # 10
+            dist_c,                                                  # 11
+            is_orbiting.astype(jnp.float32),                         # 12
+            is_comet.astype(jnp.float32),                            # 13
+            orbit_r_norm,                                            # 14
+            orbit_angle_sin,                                         # 15
+            orbit_angle_cos,                                         # 16
+            _ships_log_norm(incoming_me),                            # 17
+            _ships_log_norm(incoming_enemy),                         # 18
+            eta_me_norm,                                             # 19
+            eta_enemy_norm,                                          # 20
+            roi_norm,                                                # 21
+            is_high_value,                                           # 22
+            nearest_enemy_d - nearest_friend_d,                      # 23
+            ship_rank_all,                                           # 24
+            prod_rank_all,                                           # 25
+            net_balance_signed_log,                                  # 26
+            would_lose.astype(jnp.float32),                          # 27
+            time_to_nearest_enemy,                                   # 28
+            time_to_nearest_neutral,                                 # 29
+            is_my_largest.astype(jnp.float32),                       # 30
+            is_enemy_largest.astype(jnp.float32),                    # 31
+            comet_remaining_norm,                                    # 32
+            jnp.broadcast_to(turn, (MAX_PLANETS,)),                                            # 33
+            jnp.broadcast_to(1.0 - turn, (MAX_PLANETS,)),                                      # 34
+            jnp.broadcast_to(my_planet_count / jnp.float32(MAX_PLANETS), (MAX_PLANETS,)),      # 35
+            jnp.broadcast_to(enemy_planet_count / jnp.float32(MAX_PLANETS), (MAX_PLANETS,)),   # 36
+            jnp.broadcast_to(neutral_planet_count / jnp.float32(MAX_PLANETS), (MAX_PLANETS,)), # 37
+            jnp.broadcast_to(my_prod / jnp.float32(50.0), (MAX_PLANETS,)),                     # 38
+            jnp.broadcast_to(enemy_prod / jnp.float32(50.0), (MAX_PLANETS,)),                  # 39
+            jnp.broadcast_to(_ships_log_norm(my_ships), (MAX_PLANETS,)),                       # 40
+            jnp.broadcast_to(_ships_log_norm(enemy_ships), (MAX_PLANETS,)),                    # 41
+            jnp.broadcast_to(prod_lead, (MAX_PLANETS,)),                                       # 42
+            jnp.broadcast_to(ship_lead, (MAX_PLANETS,)),                                       # 43
+            jnp.broadcast_to(active_comets / jnp.float32(MAX_COMET_GROUPS), (MAX_PLANETS,)),   # 44
+            jnp.broadcast_to(_fleet_ships_log_norm(my_fleet_ships), (MAX_PLANETS,)),           # 45
+            jnp.broadcast_to(_fleet_ships_log_norm(enemy_fleet_ships), (MAX_PLANETS,)),        # 46
+            jnp.broadcast_to(my_fleet_count / jnp.float32(MAX_FLEETS), (MAX_PLANETS,)),        # 47
+            jnp.broadcast_to(enemy_fleet_count / jnp.float32(MAX_FLEETS), (MAX_PLANETS,)),     # 48
+            jnp.broadcast_to(_ships_log_norm(my_largest_ships), (MAX_PLANETS,)),               # 49
+            jnp.broadcast_to(_ships_log_norm(enemy_largest_ships), (MAX_PLANETS,)),            # 50
+            jnp.broadcast_to(my_largest_prod / PRODUCTION_DENOM, (MAX_PLANETS,)),              # 51
+            jnp.broadcast_to(enemy_largest_prod / PRODUCTION_DENOM, (MAX_PLANETS,)),           # 52
+            jnp.broadcast_to(next_comet_in, (MAX_PLANETS,)),                                   # 53
+            jnp.broadcast_to(is_late_game, (MAX_PLANETS,)),                                    # 54
+        ],
+        axis=-1,
+    )
     planet_features = jnp.where(active[:, None], planet_features, 0.0)
-
-    # ---------------- Fleet features --------------------------------------
-    fleet_owner = fleets[:, 1]
-    fleet_ships = fleets[:, 6]
-    fleet_active = fleets[:, 7] > 0.0
-    f_is_me = fleet_active & (fleet_owner == player_f)
-    f_is_enemy = fleet_active & (fleet_owner >= 0.0) & (fleet_owner != player_f)
-    fspeed = fleet_speed(fleet_ships, state.ship_speed)
-    fx = fleets[:, 2]
-    fy = fleets[:, 3]
-    fangle = fleets[:, 4]
-    
-    fleet_features = jnp.stack([
-        fleet_active.astype(jnp.float32), f_is_me.astype(jnp.float32), f_is_enemy.astype(jnp.float32),
-        _fleet_ships_log_norm(fleet_ships), jnp.cos(fangle), jnp.sin(fangle), fx / BOARD_SIZE, fy / BOARD_SIZE,
-        fspeed / state.ship_speed, (fx - CENTER) / DIST_DENOM, (fy - CENTER) / DIST_DENOM
-    ], axis=-1)
-    fleet_features = jnp.pad(fleet_features, ((0, 0), (0, FLEET_FEATURE_DIM - fleet_features.shape[-1])))
-    fleet_features = jnp.where(fleet_active[:, None], fleet_features, 0.0)
+    planet_mask = active
 
     return {
         "planet_features": planet_features,
-        "planet_mask": active,
-        "fleet_features": fleet_features,
-        "fleet_mask": fleet_active,
-        "global_features": global_features,
+        "planet_mask": planet_mask,
     }
 
+
+# Pre-jitted single + batched variants for convenience.
+encode_observation_jit = jax.jit(encode_observation, static_argnames=())
+
+
 def encode_batch(states: OrbitWarsState, players: jnp.ndarray) -> dict[str, jnp.ndarray]:
+    """Vmapped encoder. `players` has shape (B,) int32."""
     return jax.vmap(encode_observation, in_axes=(0, 0))(states, players)
 
+
 encode_batch_jit = jax.jit(encode_batch)
-encode_observation_jit = jax.jit(encode_observation)
