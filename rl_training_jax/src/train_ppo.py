@@ -59,8 +59,11 @@ class TrainConfig:
     clip_coef: float = 0.2
     ent_coef: float = 0.05  # Increased to fight policy collapse
     vf_coef: float = 0.5
-    lr_start: float = 1e-3
-    lr_end: float = 1e-5
+    pi_lr: float = 3e-4
+    vf_lr: float = 4e-4
+    lr_end: float = 1e-6
+    lr_warmup_updates: int = 100
+    lr_total_updates: int = 1000
     max_grad_norm: float = 0.5
 
     # Opponent
@@ -101,8 +104,11 @@ def load_config(path: str | Path) -> TrainConfig:
         clip_coef=float(ppo.get("clip_coef", 0.2)),
         ent_coef=float(ppo.get("ent_coef", 0.05)),
         vf_coef=float(ppo.get("vf_coef", 0.5)),
-        lr_start=float(ppo.get("lr_start", 1e-3)),
-        lr_end=float(ppo.get("lr_end", 1e-5)),
+        pi_lr=float(ppo.get("pi_lr", 3e-4)),
+        vf_lr=float(ppo.get("vf_lr", 4e-4)),
+        lr_end=float(ppo.get("lr_end", 1e-6)),
+        lr_warmup_updates=int(ppo.get("lr_warmup_updates", 100)),
+        lr_total_updates=int(ppo.get("lr_total_updates", 1000)),
         max_grad_norm=float(ppo.get("max_grad_norm", 0.5)),
         opponent=str(data.get("opponent", "selfplay")),
         heuristic_win_rate=float(opp.get("win_rate", 0.6)),
@@ -446,18 +452,53 @@ def maybe_spawn_comets_host(states: OrbitWarsState, cfg: TrainConfig) -> OrbitWa
 # ---------------------------------------------------------------------------
 
 
-def make_optimizer(cfg: TrainConfig):
-    # Total optimizer steps = total_updates * epochs * ceil(n_rows / minibatch_size)
+def make_optimizer(cfg: TrainConfig, params):
+    # n_rows = num_envs * rollout_steps
     n_rows = cfg.num_envs * cfg.rollout_steps
     steps_per_epoch = (n_rows + cfg.minibatch_size - 1) // cfg.minibatch_size
-    total_steps = cfg.total_updates * cfg.epochs * steps_per_epoch
+    steps_per_update = cfg.epochs * steps_per_epoch
+    
+    warmup_steps = cfg.lr_warmup_updates * steps_per_update
+    total_steps = cfg.lr_total_updates * steps_per_update
 
-    schedule = optax.cosine_decay_schedule(
-        init_value=cfg.lr_start,
-        decay_steps=total_steps,
-        alpha=cfg.lr_end / max(cfg.lr_start, 1e-12),
+    def make_schedule(init_lr):
+        return optax.warmup_linear_decay_schedule(
+            init_value=0.0,
+            peak_value=init_lr,
+            warmup_steps=warmup_steps,
+            decay_steps=total_steps,
+            end_value=cfg.lr_end,
+        )
+
+    pi_schedule = make_schedule(cfg.pi_lr)
+    vf_schedule = make_schedule(cfg.vf_lr)
+
+    # Label parameters: 'vf' for value_head, 'pi' for everything else.
+    def label_fn(path, _):
+        # path is a tuple of strings, e.g. ('params', 'value_head', 'layers_0', 'kernel')
+        names = [p.key if hasattr(p, 'key') else str(p) for p in path]
+        if 'value_head' in names:
+            return 'vf'
+        return 'pi'
+
+    # Create multi-optimizer
+    labels = jax.tree_util.tree_map_with_path(label_fn, params)
+    
+    optimizer = optax.multi_transform(
+        {
+            'pi': optax.adamw(pi_schedule, weight_decay=cfg.weight_decay),
+            'vf': optax.adamw(vf_schedule, weight_decay=cfg.weight_decay),
+        },
+        labels
     )
-    return optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adamw(schedule, weight_decay=cfg.weight_decay)), schedule
+    
+    # Wrap with global norm clipping
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(cfg.max_grad_norm),
+        optimizer
+    )
+    
+    return optimizer, pi_schedule, vf_schedule
 
 
 def init_policy_params(rng, model: PlanetPolicy):
@@ -493,7 +534,7 @@ def train(cfg: TrainConfig) -> None:
     )
     params, _ = init_policy_params(init_rng, model)
     opp_params = params
-    optimizer, _ = make_optimizer(cfg)
+    optimizer, pi_sched, vf_sched = make_optimizer(cfg, params)
     opt_state = optimizer.init(params)
 
     grid_fn = functools.partial(
@@ -538,12 +579,16 @@ def train(cfg: TrainConfig) -> None:
 
     header = (
         "  update |   mode   | lrnr_wr | W-L-D | episodes | mean_ret | env_sps | "
-        "  loss  | pol_loss | val_loss | entropy |   ev   | approx_kl | clip_fr"
+        "  loss  | pol_loss | val_loss | entropy |   ev   | approx_kl | clip_fr | pi_lr | vf_lr"
     )
     log_print(header)
     log_print("-" * len(header))
 
     t_start = time.perf_counter()
+    
+    n_rows_full = cfg.num_envs * cfg.rollout_steps
+    steps_per_epoch = (n_rows_full + cfg.minibatch_size - 1) // cfg.minibatch_size
+    steps_per_update = cfg.epochs * steps_per_epoch
 
     for update_idx in range(1, cfg.total_updates + 1):
         # ------- Rollout -------
@@ -691,6 +736,12 @@ def train(cfg: TrainConfig) -> None:
         wld = f"{learner_wins}-{learner_losses}-{learner_draws}"
 
         if update_idx % cfg.log_every == 0:
+            # Get current LR values from schedules
+            # current step for schedule = update_idx * steps_per_update
+            cur_step = update_idx * steps_per_update
+            plr = float(pi_sched(cur_step))
+            vlr = float(vf_sched(cur_step))
+
             log_print(
                 f"{update_idx:6d} | {active_mode:8s} | "
                 f"{learner_wr:7.1%} | "
@@ -698,7 +749,8 @@ def train(cfg: TrainConfig) -> None:
                 f"{episodes:7d} | {mean_ret:+.3f} | {env_sps:7.0f} | "
                 f"{metrics_accum['loss']:.4f} | {metrics_accum['policy_loss']:+.4f} | "
                 f"{metrics_accum['value_loss']:.4f} | {metrics_accum['entropy']:.3f} | "
-                f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f}"
+                f"{ev:+.3f} | {metrics_accum['approx_kl']:.5f} | {metrics_accum['clip_fraction']:.3f} | "
+                f"{plr:.2e} | {vlr:.2e}"
             )
             learner_wins = learner_losses = learner_draws = 0
 
