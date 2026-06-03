@@ -75,7 +75,7 @@ class PlanetPolicy(nn.Module):
     num_heads: int = 4
     num_layers: int = 3
     ff_mult: int = 4
-    noop_bias_init: float = 2.0
+    noop_bias_init: float = 1.0
 
     def setup(self) -> None:
         self.planet_in = nn.Dense(self.d_model)

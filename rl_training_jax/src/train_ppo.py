@@ -59,11 +59,11 @@ class TrainConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.97
     clip_coef: float = 0.2
-    ent_coef: float = 0.1  # Increased to strongly fight policy collapse
+    ent_coef: float = 0.02  # Reduced to allow the model to commit to strong moves
     vf_coef: float = 0.5
     pi_lr: float = 3e-4
     vf_lr: float = 1e-3
-    lr_end: float = 1e-6
+    lr_end: float = 1e-4
     lr_warmup_updates: int = 100
     lr_total_updates: int = 1000
     max_grad_norm: float = 0.5
@@ -106,11 +106,11 @@ def load_config(path: str | Path) -> TrainConfig:
         gamma=float(ppo.get("gamma", 0.99)),
         gae_lambda=float(ppo.get("gae_lambda", 0.97)),
         clip_coef=float(ppo.get("clip_coef", 0.2)),
-        ent_coef=float(ppo.get("ent_coef", 0.1)),
+        ent_coef=float(ppo.get("ent_coef", 0.02)),
         vf_coef=float(ppo.get("vf_coef", 0.5)),
         pi_lr=float(ppo.get("pi_lr", 3e-4)),
         vf_lr=float(ppo.get("vf_lr", 1e-3)),
-        lr_end=float(ppo.get("lr_end", 1e-6)),
+        lr_end=float(ppo.get("lr_end", 1e-4)),
         lr_warmup_updates=int(ppo.get("lr_warmup_updates", 100)),
         lr_total_updates=int(ppo.get("lr_total_updates", 1000)),
         max_grad_norm=float(ppo.get("max_grad_norm", 0.5)),
