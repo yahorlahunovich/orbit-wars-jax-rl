@@ -85,9 +85,8 @@ class PlanetPolicy(nn.Module):
         ]
         self.target_proj_q = nn.Dense(self.d_model)
         self.target_proj_k = nn.Dense(self.d_model)
-        self.bucket_head = nn.Sequential(
-            [nn.Dense(self.d_model), nn.gelu, nn.Dense(self.bucket_count)]
-        )
+        self.bucket_src = nn.Dense(self.bucket_count)
+        self.bucket_tgt = nn.Dense(self.bucket_count)
         self.value_head = nn.Sequential(
             [nn.Dense(self.d_model), nn.gelu, nn.Dense(1)]
         )
@@ -122,14 +121,10 @@ class PlanetPolicy(nn.Module):
         diag_mask = jnp.eye(p, dtype=target_logits.dtype)            # (P, P)
         target_logits = target_logits + diag_mask[None, :, :] * self.noop_bias
 
-        # Bucket head: (B, P, P, BUCKETS)
-        h_src = planet_h[:, :, None, :]                       # (B, P, 1, d)
-        h_tgt = planet_h[:, None, :, :]                       # (B, 1, P, d)
-        pair_h = jnp.concatenate([
-            jnp.broadcast_to(h_src, (b, p, p, self.d_model)),
-            jnp.broadcast_to(h_tgt, (b, p, p, self.d_model))
-        ], axis=-1)                                          # (B, P, P, 2d)
-        bucket_logits = self.bucket_head(pair_h)             # (B, P, P, BUCKETS)
+        # Bucket head: Factorized representation for fast O(P^2) assembly
+        b_src = self.bucket_src(planet_h)                    # (B, P, BUCKETS)
+        b_tgt = self.bucket_tgt(planet_h)                    # (B, P, BUCKETS)
+        bucket_logits = b_src[:, :, None, :] + b_tgt[:, None, :, :]  # (B, P, P, BUCKETS)
 
         # Value head
         valid_count = jnp.maximum(jnp.sum(planet_mask, axis=1, keepdims=True), 1.0)

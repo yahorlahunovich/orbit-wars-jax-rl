@@ -151,15 +151,14 @@ def compose_action_grid(
     p_count = planets.shape[0]
     bucket_axis = ship_counts.shape[-1]
     
-    src_x_b = jnp.broadcast_to(x[:, None, None], (p_count, p_count, bucket_axis))
-    src_y_b = jnp.broadcast_to(y[:, None, None], (p_count, p_count, bucket_axis))
-    src_r_b = jnp.broadcast_to(radius[:, None, None], (p_count, p_count, bucket_axis))
+    src_x_b = x[:, None, None]
+    src_y_b = y[:, None, None]
+    src_r_b = radius[:, None, None]
     
-    tgt_id_b = jnp.broadcast_to(pids[None, :, None], (p_count, p_count, bucket_axis))
-    tgt_x_b = jnp.broadcast_to(x[None, :, None], (p_count, p_count, bucket_axis))
-    tgt_y_b = jnp.broadcast_to(y[None, :, None], (p_count, p_count, bucket_axis))
-    tgt_r_b = jnp.broadcast_to(radius[None, :, None], (p_count, p_count, bucket_axis))
-    tgt_orb_b = jnp.broadcast_to(tgt_orbiting[None, :, None], (p_count, p_count, bucket_axis))
+    tgt_x_b = x[None, :, None]
+    tgt_y_b = y[None, :, None]
+    tgt_r_b = radius[None, :, None]
+    tgt_orb_b = tgt_orbiting[None, :, None]
 
     # Precompute comet trajectories to avoid doing it inside the geometry loops
     from .geometry import precompute_comet_trajectories
@@ -168,11 +167,12 @@ def compose_action_grid(
         state.comets.paths, state.comets.path_lengths, pids
     )
     
-    tgt_com_b = jnp.broadcast_to(is_comet[None, :, None], (p_count, p_count, bucket_axis))
-    tgt_traj_b = jnp.broadcast_to(trajectories[None, :, None, :, :], (p_count, p_count, bucket_axis) + trajectories.shape[1:])
-    tgt_vt_b = jnp.broadcast_to(valid_time[None, :, None, :], (p_count, p_count, bucket_axis) + valid_time.shape[1:])
+    tgt_com_b = is_comet[None, :, None]
+    tgt_traj_b = trajectories[None, :, None, :, :]  # (1, P, 1, L, 2)
+    tgt_vt_b = valid_time[None, :, None, :]  # (1, P, 1, L)
 
     # Perform intercept estimation (iterative)
+    # JAX will automatically broadcast (P, 1, 1), (1, P, 1), and (P, P, B) arrays internally.
     angle, aim_x, aim_y, sun_blocks = estimate_intercept_angles(
         src_x_b, src_y_b, src_r_b,
         tgt_x_b, tgt_y_b, tgt_r_b,

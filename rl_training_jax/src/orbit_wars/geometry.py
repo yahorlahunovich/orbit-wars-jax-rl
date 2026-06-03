@@ -240,18 +240,13 @@ def predict_target_position_fast(
     # 1. Comet path
     safe_idx = jnp.clip(turns_ahead.astype(jnp.int32), 0, MAX_LEN - 1)
     
-    # tgt_traj is (P, P, B, MAX_LEN, 2)
-    # We want to index into the second to last dimension.
-    # We can do this efficiently by flattening the spatial dimensions.
-    orig_shape = safe_idx.shape
-    flat_idx = safe_idx.reshape(-1)
-    flat_traj = tgt_traj.reshape(-1, MAX_LEN, 2)
-    
-    # Advanced indexing:
-    flat_c = flat_traj[jnp.arange(flat_idx.shape[0]), flat_idx]
-    
-    cx = flat_c[:, 0].reshape(orig_shape)
-    cy = flat_c[:, 1].reshape(orig_shape)
+    # tgt_traj is (..., MAX_LEN, 2)
+    # safe_idx is (...)
+    idx = safe_idx[..., None, None] # (..., 1, 1)
+    idx = jnp.broadcast_to(idx, safe_idx.shape + (1, 2)) # (..., 1, 2)
+    c = jnp.take_along_axis(tgt_traj, idx, axis=-2) # (..., 1, 2)
+    cx = c[..., 0, 0]
+    cy = c[..., 0, 1]
     
     # 2. Orbital path
     ox, oy = predict_planet_position(tgt_x, tgt_y, tgt_is_orbiting, turns_ahead, angular_velocity)
@@ -310,22 +305,10 @@ def solve_intercept_with_wait(
     turns, aim_x, aim_y = jax.lax.fori_loop(0, n_iter, body, (turns, ix0, iy0))
     blocked = sun_hit(sx, sy, aim_x, aim_y, margin=sun_margin)
 
-    def try_future_wait(carry, wait_t):
-        best_aim_x, best_aim_y, best_turns, currently_blocked = carry
-        fx, fy = predict_target_position_fast(tx, ty, is_orb, is_com, tgt_traj, tgt_valid_time, wait_t, angular_velocity)
-        f_blocked = sun_hit(sx, sy, fx, fy, margin=sun_margin)
-        f_turns = get_arrival_turns(sx, sy, sr, fx, fy, tr, count, speed)
-        should_update = currently_blocked & (~f_blocked)
-        return (
-            jnp.where(should_update, fx, best_aim_x),
-            jnp.where(should_update, fy, best_aim_y),
-            jnp.where(should_update, f_turns, best_turns),
-            currently_blocked & f_blocked
-        ), None
-
-    wait_times = jnp.array([2.0, 4.0, 6.0, 8.0, 10.0], dtype=jnp.float32)
-    (aim_x, aim_y, turns, final_blocked), _ = jax.lax.scan(try_future_wait, (aim_x, aim_y, turns, blocked), wait_times)
-    return aim_x, aim_y, turns, final_blocked
+    # Note: O(P^3) wait logic removed. The RL agent naturally learns to wait (NOOP)
+    # when the direct path is currently blocked by the sun.
+    
+    return aim_x, aim_y, turns, blocked
 
 
 def solve_intercept(
@@ -337,7 +320,7 @@ def solve_intercept(
     ship_count: jnp.ndarray,
     angular_velocity: jnp.ndarray,
     max_speed: jnp.ndarray,
-    n_iter: int = 25,
+    n_iter: int = 65,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     aim_x, aim_y, turns, _blocked = solve_intercept_with_wait(
         src_x, src_y, 0.0, 
