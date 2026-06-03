@@ -58,11 +58,11 @@ def remove_expired_comets(state: OrbitWarsState) -> OrbitWarsState:
     for gi in range(MAX_COMET_GROUPS):
         if not active_groups[gi]:
             continue
-        idx_next = int(path_index[gi]) + 1
+        idx_now = int(path_index[gi])
         for pi in range(4):
             pid = int(planet_ids[gi, pi])
             plen = int(path_lengths[gi, pi])
-            if pid < 0 or plen <= 0 or idx_next < plen:
+            if pid < 0 or plen <= 0 or idx_now < plen:
                 continue
             slot = id_to_slot.get(pid)
             if slot is None:
@@ -142,12 +142,7 @@ def _apply_moves(
     action_mask: jnp.ndarray,
     player: jnp.int32,
 ) -> OrbitWarsState:
-    """Apply one player's moves sequentially.
-
-    Sequentiality only matters for ship deduction (subsequent moves from the
-    same source see the deducted balance). We precompute source-planet slots
-    once (vectorized) and only run the small sequential scan over moves.
-    """
+    """Apply one player's moves sequentially."""
     planets = state.planets
     fleets = state.fleets
     n_fleets = state.n_fleets
@@ -156,15 +151,15 @@ def _apply_moves(
     pids_i32 = planets[:, 0].astype(jnp.int32)
     active_planet = planets[:, 7] > 0.0
 
-    move_from = actions[:, 0].astype(jnp.int32)              # (M,)
-    move_angle = actions[:, 1]                                # (M,)
-    move_ships_i32 = actions[:, 2].astype(jnp.int32)          # (M,)
+    move_from = actions[:, 0].astype(jnp.int32)
+    move_angle = actions[:, 1]
+    move_ships_i32 = actions[:, 2].astype(jnp.int32)
 
-    match = (move_from[:, None] == pids_i32[None, :]) & active_planet[None, :]   # (M, P)
-    source_idx = jnp.argmax(match.astype(jnp.int32), axis=-1)                    # (M,)
-    source_exists = jnp.any(match, axis=-1)                                      # (M,)
+    match = (move_from[:, None] == pids_i32[None, :]) & active_planet[None, :]
+    source_idx = jnp.argmax(match.astype(jnp.int32), axis=-1)
+    source_exists = jnp.any(match, axis=-1)
 
-    use_move = (action_mask > 0.0) & (move_ships_i32 > 0) & source_exists        # (M,)
+    use_move = (action_mask > 0.0) & (move_ships_i32 > 0) & source_exists
 
     player_f = player.astype(jnp.float32)
 
@@ -225,26 +220,19 @@ def _production(state: OrbitWarsState) -> OrbitWarsState:
 
 
 def _compute_planet_paths(state: OrbitWarsState):
-    """Returns (pids, old_x, old_y, new_x, new_y, radius, check).
-
-    Vectorized: no per-planet fori_loop. Comet positions are computed for each
-    of the (MAX_COMET_GROUPS, 4) comet planet slots and scattered into the
-    planet array by slot index.
-    """
+    """Returns (pids, old_x, old_y, new_x, new_y, radius, check)."""
     pids_i32 = state.planets[:, 0].astype(jnp.int32)
     old_x = state.planets[:, 2]
     old_y = state.planets[:, 3]
     radius = state.planets[:, 4]
     active = state.planets[:, 7] > 0.0
 
-    # is_comet via broadcast (P, K)
-    cpids = state.comet_planet_ids  # (MAX_COMET_PLANETS,) int32, -1 padded
+    cpids = state.comet_planet_ids
     valid_cpid = cpids >= 0
     is_comet = active & jnp.any(
         (pids_i32[:, None] == cpids[None, :]) & valid_cpid[None, :], axis=-1
     )
 
-    # Rotation for non-comet active planets
     init = state.initial_planets
     dx0 = init[:, 2] - CENTER
     dy0 = init[:, 3] - CENTER
@@ -258,68 +246,57 @@ def _compute_planet_paths(state: OrbitWarsState):
     new_y = jnp.where(rotating, rot_y, old_y)
     check = jnp.where(active & (~is_comet), 1.0, 0.0)
 
-    # ---- Comet path lookup (vectorized scatter) ------------------------
+    # ---- Comet path lookup ------------------------
     comets = state.comets
-    cgpids = comets.planet_ids                       # (G, 4) int32
-    cplens = comets.path_lengths                     # (G, 4) int32
-    cactive = comets.active                          # (G,) bool
-    idx_g = comets.path_index + 1                    # (G,) int32
+    cgpids = comets.planet_ids
+    cplens = comets.path_lengths
+    cactive = comets.active
+    idx_g = comets.path_index + 1
     idx_clip = jnp.clip(idx_g, 0, MAX_COMET_PATH_LEN - 1)
 
-    # For each (g, q) find the matching planet slot. Many of these will be
-    # padding (cgpids < 0) — we mask those out.
     match_gqp = (
         (cgpids[..., None] == pids_i32[None, None, :])
         & active[None, None, :]
         & (cgpids[..., None] >= 0)
-    )                                                # (G, 4, P)
-    slot_gq = jnp.argmax(match_gqp.astype(jnp.int32), axis=-1)  # (G, 4)
-    has_match_gq = jnp.any(match_gqp, axis=-1)                  # (G, 4)
+    )
+    slot_gq = jnp.argmax(match_gqp.astype(jnp.int32), axis=-1)
+    has_match_gq = jnp.any(match_gqp, axis=-1)
 
     on_board_gq = (idx_g[:, None] < cplens) & has_match_gq & cactive[:, None]
     is_comet_slot_gq = has_match_gq & cactive[:, None]
 
-    # Gather positions: paths[g, q, idx_g[g], :]
     g_arange = jnp.arange(MAX_COMET_GROUPS)
     q_arange = jnp.arange(4)
-    g_grid, q_grid = jnp.meshgrid(g_arange, q_arange, indexing="ij")  # (G, 4)
+    g_grid, q_grid = jnp.meshgrid(g_arange, q_arange, indexing="ij")
     idx_grid = jnp.broadcast_to(idx_clip[:, None], (MAX_COMET_GROUPS, 4))
-    path_xy = comets.paths[g_grid, q_grid, idx_grid, :]  # (G, 4, 2)
+    path_xy = comets.paths[g_grid, q_grid, idx_grid, :]
     path_px = path_xy[..., 0]
     path_py = path_xy[..., 1]
 
-    # Flatten to (G*4,) for scatter.
     flat_slot = slot_gq.reshape(-1)
     flat_on = on_board_gq.reshape(-1)
     flat_px = path_px.reshape(-1)
     flat_py = path_py.reshape(-1)
     flat_is_comet_slot = is_comet_slot_gq.reshape(-1)
 
-    # Scatter on-board comet positions. Multiple writes to the same slot
-    # cannot happen because each planet id is unique within active groups.
-    nx_at_slot = jnp.where(flat_on, flat_px, new_x[flat_slot])
-    ny_at_slot = jnp.where(flat_on, flat_py, new_y[flat_slot])
-    new_x = new_x.at[flat_slot].set(nx_at_slot)
-    new_y = new_y.at[flat_slot].set(ny_at_slot)
+    new_x = new_x.at[flat_slot].set(jnp.where(flat_on, flat_px, new_x[flat_slot]))
+    new_y = new_y.at[flat_slot].set(jnp.where(flat_on, flat_py, new_y[flat_slot]))
 
-    # Comet planet slots get check=1 (collision-eligible) whether on or off
-    # board, mirroring the reference env behaviour.
-    check_at_slot = jnp.where(flat_is_comet_slot, 1.0, check[flat_slot])
+    # FIX: Newly placed comets (idx_g == 0) are not collision-eligible (Point 3).
+    flat_idx_g = jnp.broadcast_to(idx_g[:, None], (MAX_COMET_GROUPS, 4)).reshape(-1)
+    check_at_slot = jnp.where(flat_is_comet_slot & (flat_idx_g > 0), 1.0, check[flat_slot])
     check = check.at[flat_slot].set(check_at_slot)
 
     return pids_i32, old_x, old_y, new_x, new_y, radius, check
 
 
 def _move_fleets(state, pids_i32, old_x, old_y, new_x, new_y, radius, check):
-    """Returns (state, combat[planet, player]).
-
-    Vectorized: builds the full (F, P) swept-collision matrix in one op.
-    """
+    """Returns (state, combat[planet, player])."""
     max_speed = state.ship_speed
     fleets = state.fleets
 
-    active_f = fleets[:, 7] > 0.0                       # (F,)
-    owner = fleets[:, 1].astype(jnp.int32)              # (F,)
+    active_f = fleets[:, 7] > 0.0
+    owner = fleets[:, 1].astype(jnp.int32)
     angle = fleets[:, 4]
     ships = fleets[:, 6]
     old_fx = fleets[:, 2]
@@ -328,25 +305,21 @@ def _move_fleets(state, pids_i32, old_x, old_y, new_x, new_y, radius, check):
     new_fx = old_fx + jnp.cos(angle) * speed
     new_fy = old_fy + jnp.sin(angle) * speed
 
-    # (F, P) swept-collision matrix
     hit_fp = swept_pair_hit(
         old_fx[:, None], old_fy[:, None], new_fx[:, None], new_fy[:, None],
         old_x[None, :], old_y[None, :], new_x[None, :], new_y[None, :], radius[None, :],
-    )                                                   # (F, P)
+    )
     eligible = (check[None, :] > 0.0) & active_f[:, None]
     hit_fp = hit_fp & eligible
 
-    # First-hit planet per fleet (lowest planet index that hits)
-    any_hit = jnp.any(hit_fp, axis=-1)                  # (F,)
-    first_hit = jnp.argmax(hit_fp.astype(jnp.int32), axis=-1)  # (F,)
+    any_hit = jnp.any(hit_fp, axis=-1)
+    first_hit = jnp.argmax(hit_fp.astype(jnp.int32), axis=-1)
     hit_idx = jnp.where(any_hit, first_hit, -1)
 
-    # Sun + bounds
     out_bounds = ~in_bounds(new_fx, new_fy)
     sun = sun_hit(old_fx, old_fy, new_fx, new_fy)
     remove = active_f & ((hit_idx >= 0) | out_bounds | sun)
 
-    # Scatter-add ships into combat[planet, player]
     combat = jnp.zeros((MAX_PLANETS, NUM_PLAYERS), dtype=jnp.float32)
     hit_mask = active_f & (hit_idx >= 0)
     safe_hit_idx = jnp.where(hit_mask, hit_idx, 0)
@@ -373,24 +346,18 @@ def _advance_comet_indices(state: OrbitWarsState) -> OrbitWarsState:
 
 
 def _expire_comets_in_jit(state: OrbitWarsState) -> OrbitWarsState:
-    """Deactivate comet planets whose path has ended (vectorized, JIT-safe).
-
-    After `_advance_comet_indices`, comets.path_index points at the freshly
-    consumed step. A comet quad has expired when path_index >= path_length
-    (i.e. we have moved past the last waypoint). Mirrors the Python
-    `remove_expired_comets` behaviour.
-    """
+    """Deactivate comet planets whose path has ended (vectorized, JIT-safe)."""
     comets = state.comets
-    cgpids = comets.planet_ids                       # (G, 4)
-    cplens = comets.path_lengths                     # (G, 4)
-    cactive = comets.active                          # (G,)
-    idx_now = comets.path_index                      # (G,) — already advanced
+    cgpids = comets.planet_ids
+    cplens = comets.path_lengths
+    cactive = comets.active
+    idx_now = comets.path_index
 
     pids_i32 = state.planets[:, 0].astype(jnp.int32)
     active = state.planets[:, 7] > 0.0
 
-    expired_gq = (idx_now[:, None] >= cplens) & (cplens > 0) & cactive[:, None] & (cgpids >= 0)
-    # For each (g, q) where expired, find the matching planet slot and clear active.
+    # FIX: Expire if the NEXT index would be out of bounds (Point 2)
+    expired_gq = (idx_now[:, None] + 1 >= cplens) & (cplens > 0) & cactive[:, None] & (cgpids >= 0)
     match_gqp = (
         (cgpids[..., None] == pids_i32[None, None, :])
         & active[None, None, :]
@@ -411,7 +378,6 @@ def _expire_comets_in_jit(state: OrbitWarsState) -> OrbitWarsState:
 
 
 def _resolve_combat(state: OrbitWarsState, combat: jnp.ndarray) -> OrbitWarsState:
-    """Pure elementwise combat resolution (no fori_loop)."""
     planets = state.planets
     active = planets[:, 7] > 0.0
     ships_p0 = combat[:, 0]
@@ -457,27 +423,21 @@ def _termination(state: OrbitWarsState) -> OrbitWarsState:
     fleet_owners = state.fleets[:, 1].astype(jnp.int32)
     planet_owners = state.planets[:, 1].astype(jnp.int32)
 
-    # Vectorized presence + score per player (NUM_PLAYERS == 2).
     p_range = jnp.arange(NUM_PLAYERS, dtype=jnp.int32)
-    owned_match = owned[None, :] & (planet_owners[None, :] == p_range[:, None])     # (P_n, P)
-    fleet_match = fleet_active[None, :] & (fleet_owners[None, :] == p_range[:, None])  # (P_n, F)
+    owned_match = owned[None, :] & (planet_owners[None, :] == p_range[:, None])
+    fleet_match = fleet_active[None, :] & (fleet_owners[None, :] == p_range[:, None])
 
     has_any = jnp.any(owned_match, axis=-1) | jnp.any(fleet_match, axis=-1)
     alive_count = jnp.sum(has_any.astype(jnp.int32))
     terminated = terminated_by_steps | (alive_count <= 1)
 
-    planet_score = jnp.sum(
-        jnp.where(owned_match, state.planets[None, :, 5], 0.0), axis=-1
-    )
-    fleet_score = jnp.sum(
-        jnp.where(fleet_match, state.fleets[None, :, 6], 0.0), axis=-1
-    )
-    scores = planet_score + fleet_score                          # (NUM_PLAYERS,)
+    planet_score = jnp.sum(jnp.where(owned_match, state.planets[None, :, 5], 0.0), axis=-1)
+    fleet_score = jnp.sum(jnp.where(fleet_match, state.fleets[None, :, 6], 0.0), axis=-1)
+    scores = planet_score + fleet_score
 
     max_score = jnp.max(scores)
     all_max = jnp.all(scores == max_score)
     
-    # Reward: 1.0 for strictly winning, -1.0 for strictly losing, 0.0 for ties.
     rewards = jnp.where(
         terminated,
         jnp.where(
@@ -503,14 +463,19 @@ def step_jit(
     mask_p0: jnp.ndarray,
     mask_p1: jnp.ndarray,
 ) -> OrbitWarsState:
+    # 1. Expire comets before processing moves (Point 2)
+    state = _expire_comets_in_jit(state)
+    
     state = _apply_moves(state, actions_p0, mask_p0, jnp.int32(0))
     state = _apply_moves(state, actions_p1, mask_p1, jnp.int32(1))
     state = _production(state)
     pids, old_x, old_y, new_x, new_y, radius, check = _compute_planet_paths(state)
     state, combat = _move_fleets(state, pids, old_x, old_y, new_x, new_y, radius, check)
     state = _apply_planet_positions(state, new_x, new_y)
+    
+    # 2. Advance indices for the NEXT step
     state = _advance_comet_indices(state)
-    state = _expire_comets_in_jit(state)
+    
     state = _resolve_combat(state, combat)
     state = state.replace(step=state.step + 1)
     state = _termination(state)
@@ -526,12 +491,6 @@ def step(
     mask_p0: jnp.ndarray | None = None,
     mask_p1: jnp.ndarray | None = None,
 ) -> OrbitWarsState:
-    """Full step: Python-side comet spawn (rare) then vectorized JIT physics.
-
-    Comet *expiry* now happens inside `step_jit` (mask-based). This function
-    only handles comet *spawning*, which still depends on RNG/path generation
-    that lives in numpy.
-    """
     state = _maybe_spawn_comet_numpy(state)
 
     if actions is not None:
@@ -540,7 +499,6 @@ def step(
     else:
         a0, m0 = actions_p0, mask_p0
         a1, m1 = actions_p1, mask_p1
-    assert a0 is not None and a1 is not None and m0 is not None and m1 is not None
 
     state = step_jit(state, a0, a1, m0, m1)
     return state
@@ -569,5 +527,4 @@ def batched_step(
     mask_p0: jnp.ndarray,
     mask_p1: jnp.ndarray,
 ) -> OrbitWarsState:
-    """Vectorized batched step. Requires pre-baked comets (no Python spawn)."""
     return jax.vmap(step_jit)(states, actions_p0, actions_p1, mask_p0, mask_p1)

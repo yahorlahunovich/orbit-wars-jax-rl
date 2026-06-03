@@ -141,38 +141,27 @@ def _fleet_projections(state: OrbitWarsState, player_f: jnp.float32) -> tuple[jn
     return incoming_me, incoming_enemy, eta_me_norm, eta_enemy_norm
 
 
-def _nearest_distance_to_subset(
-    planets: jnp.ndarray,
+def _nearest_distance_from_matrix(
+    dist_matrix: jnp.ndarray,
     subset_mask: jnp.ndarray,
 ) -> jnp.ndarray:
-    """For each planet, distance to the nearest other planet in `subset_mask`.
-
-    Returns DIST_DENOM if the subset is empty.
-    """
-    x = planets[:, 2]
-    y = planets[:, 3]
-    dx = x[:, None] - x[None, :]
-    dy = y[:, None] - y[None, :]
-    dist = jnp.sqrt(dx * dx + dy * dy)
     big = jnp.float32(1e6)
     # Exclude self and rows outside the subset.
     self_mask = jnp.eye(MAX_PLANETS, dtype=jnp.bool_)
-    masked = jnp.where(subset_mask[None, :] & (~self_mask), dist, big)
+    masked = jnp.where(subset_mask[None, :] & (~self_mask), dist_matrix, big)
     nearest = jnp.min(masked, axis=-1)
     # Convert "no subset member" sentinel (big) to a finite max distance.
     nearest = jnp.where(nearest >= big, DIST_DENOM * 3.0, nearest)
     return nearest
 
 
-def _rank_norm(values: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    """For each entry, fraction of *masked* entries with a strictly smaller value.
-
-    For inactive entries (`~mask`) returns 0. Output in `[0, 1]`. 1.0 means
-    "largest in the masked set"; 0.0 means "smallest in the masked set".
-    """
+def _rank_norm_from_matrix(
+    smaller_matrix: jnp.ndarray, # (P, P) bool: values[i] > values[j]
+    mask: jnp.ndarray,
+) -> jnp.ndarray:
     eligible_count = jnp.sum(mask.astype(jnp.float32))
     smaller = jnp.sum(
-        (values[:, None] > values[None, :])
+        smaller_matrix
         & mask[None, :]
         & mask[:, None],
         axis=-1,
@@ -261,9 +250,14 @@ def encode_observation(
 
     incoming_me, incoming_enemy, eta_me_norm, eta_enemy_norm = _fleet_projections(state, player_f)
 
-    nearest_enemy_d_raw = _nearest_distance_to_subset(planets, owner_is_enemy)
-    nearest_friend_d_raw = _nearest_distance_to_subset(planets, owner_is_me)
-    nearest_neutral_d_raw = _nearest_distance_to_subset(planets, owner_is_neutral)
+    # Precompute distance matrix O(P^2) once
+    dx_pp = x[:, None] - x[None, :]
+    dy_pp = y[:, None] - y[None, :]
+    dist_pp = jnp.sqrt(dx_pp * dx_pp + dy_pp * dy_pp)
+
+    nearest_enemy_d_raw = _nearest_distance_from_matrix(dist_pp, owner_is_enemy)
+    nearest_friend_d_raw = _nearest_distance_from_matrix(dist_pp, owner_is_me)
+    nearest_neutral_d_raw = _nearest_distance_from_matrix(dist_pp, owner_is_neutral)
     nearest_enemy_d = nearest_enemy_d_raw / DIST_DENOM
     nearest_friend_d = nearest_friend_d_raw / DIST_DENOM
 
@@ -276,10 +270,14 @@ def encode_observation(
     roi_norm = roi / jnp.float32(2.0)
     is_high_value = (production >= 3.0).astype(jnp.float32) * active.astype(jnp.float32)
 
-    ship_rank_all = _rank_norm(ships, active)
-    prod_rank_all = _rank_norm(production, active)
-    my_ship_rank = _rank_norm(ships, owner_is_me)
-    enemy_ship_rank = _rank_norm(ships, owner_is_enemy)
+    # Precompute rank matrices O(P^2) once
+    ship_smaller_pp = ships[:, None] > ships[None, :]
+    prod_smaller_pp = production[:, None] > production[None, :]
+
+    ship_rank_all = _rank_norm_from_matrix(ship_smaller_pp, active)
+    prod_rank_all = _rank_norm_from_matrix(prod_smaller_pp, active)
+    my_ship_rank = _rank_norm_from_matrix(ship_smaller_pp, owner_is_me)
+    enemy_ship_rank = _rank_norm_from_matrix(ship_smaller_pp, owner_is_enemy)
     is_my_largest = owner_is_me & (my_ship_rank >= jnp.float32(1.0 - 1e-6))
     is_enemy_largest = owner_is_enemy & (enemy_ship_rank >= jnp.float32(1.0 - 1e-6))
 
@@ -399,6 +397,8 @@ def encode_observation(
     return {
         "planet_features": planet_features,
         "planet_mask": planet_mask,
+        "incoming_me": incoming_me,
+        "incoming_enemy": incoming_enemy,
     }
 
 

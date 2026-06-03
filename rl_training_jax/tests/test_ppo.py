@@ -87,7 +87,7 @@ def test_ppo_loss_runs_and_decreases_with_better_policy():
     params = model.init(rng, **example)
 
     target_has_bucket = jnp.ones((N, P, P), jnp.bool_)
-    bucket_valid = jnp.ones((N, P, P, BUCKET_COUNT), jnp.bool_)
+    chosen_bucket_valid = jnp.ones((N, P, BUCKET_COUNT), jnp.bool_)
     executed_mask = jnp.zeros((N, P), jnp.bool_).at[:, :3].set(True)
     target_idx = jnp.zeros((N, P), jnp.int32).at[:, :3].set(1)
     bucket_idx = jnp.zeros((N, P), jnp.int32)
@@ -98,7 +98,7 @@ def test_ppo_loss_runs_and_decreases_with_better_policy():
     batch = {
         **example,
         "target_has_bucket": target_has_bucket,
-        "bucket_valid": bucket_valid,
+        "chosen_bucket_valid": chosen_bucket_valid,
         "executed_mask": executed_mask,
         "target_idx": target_idx,
         "bucket_idx": bucket_idx,

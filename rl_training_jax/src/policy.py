@@ -95,6 +95,7 @@ class PlanetPolicy(nn.Module):
         self,
         planet_features: jnp.ndarray,    # (B, P, F_p)
         planet_mask: jnp.ndarray,        # (B, P) bool
+        **_kwargs,
     ) -> PolicyOutput:
         b, p, _ = planet_features.shape
 

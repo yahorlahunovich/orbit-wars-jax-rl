@@ -48,6 +48,23 @@ def swept_pair_hit(
     p1y: jnp.ndarray,
     radius: jnp.ndarray,
 ) -> jnp.ndarray:
+    # ax, ay, bx, by: fleet start/end
+    # p0x, p0y, p1x, p1y: planet start/end
+    
+    # Optimization: AABB pre-check
+    f_min_x = jnp.minimum(ax, bx)
+    f_max_x = jnp.maximum(ax, bx)
+    f_min_y = jnp.minimum(ay, by)
+    f_max_y = jnp.maximum(ay, by)
+    
+    p_min_x = jnp.minimum(p0x, p1x) - radius
+    p_max_x = jnp.maximum(p0x, p1x) + radius
+    p_min_y = jnp.minimum(p0y, p1y) - radius
+    p_max_y = jnp.maximum(p0y, p1y) + radius
+    
+    intersect = (f_min_x <= p_max_x) & (f_max_x >= p_min_x) & \
+                (f_min_y <= p_max_y) & (f_max_y >= p_min_y)
+
     d0x = ax - p0x
     d0y = ay - p0y
     dvx = (bx - ax) - (p1x - p0x)
@@ -62,7 +79,7 @@ def swept_pair_hit(
     t1 = (-b - sq) / (2.0 * a + 1e-12)
     t2 = (-b + sq) / (2.0 * a + 1e-12)
     hit_motion = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
-    return jnp.where(no_motion, hit_no_motion, hit_motion)
+    return intersect & jnp.where(no_motion, hit_no_motion, hit_motion)
 
 
 def fleet_speed(ships: jnp.ndarray, max_speed: jnp.ndarray) -> jnp.ndarray:

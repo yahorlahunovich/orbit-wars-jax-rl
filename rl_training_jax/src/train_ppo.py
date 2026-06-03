@@ -212,11 +212,15 @@ def sample_both_players_factory(model: PlanetPolicy, grid_fn):
         out0 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_learner_p0), out_learner, out_opp)
         out1 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_opp_p0), out_learner, out_opp)
 
-        grid0 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(0))
+        grid0 = jax.vmap(grid_fn, in_axes=(0, None, 0, 0))(
+            states, jnp.int32(0), feats0["incoming_me"], feats0["incoming_enemy"]
+        )
         s0 = sample_actions(k0, out0.target_logits, out0.bucket_logits, grid0)
         a0, m0, em0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
 
-        grid1 = jax.vmap(grid_fn, in_axes=(0, None))(states, jnp.int32(1))
+        grid1 = jax.vmap(grid_fn, in_axes=(0, None, 0, 0))(
+            states, jnp.int32(1), feats1["incoming_me"], feats1["incoming_enemy"]
+        )
         s1 = sample_actions(k1, out1.target_logits, out1.bucket_logits, grid1)
         a1, m1, em1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
         
@@ -233,7 +237,9 @@ def sample_learner_factory(model: PlanetPolicy, grid_fn):
         rng, k0 = jax.random.split(rng)
         feats = jax.vmap(encode_observation, in_axes=(0, 0))(states, learner_players)
         out = model.apply(params, **feats)
-        grid = jax.vmap(grid_fn, in_axes=(0, 0))(states, learner_players)
+        grid = jax.vmap(grid_fn, in_axes=(0, 0, 0, 0))(
+            states, learner_players, feats["incoming_me"], feats["incoming_enemy"]
+        )
         sampled = sample_actions(k0, out.target_logits, out.bucket_logits, grid)
         actions, mask, executed_mask = pack_padded_actions(
             sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
@@ -339,7 +345,11 @@ def learner_record_from_single(
     new_states: OrbitWarsState,
 ) -> dict:
     target_has_bucket = jnp.any(grid["full_valid"], axis=-1)
-    bucket_valid = grid["full_valid"]
+    from .orbit_wars.decode import BUCKET_COUNT
+    t_idx = sampled["target_idx"]  # (B, P)
+    chosen_bucket_valid = jnp.take_along_axis(
+        grid["full_valid"], t_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
+    ).squeeze(2)
 
     batch = jnp.arange(new_states.rewards.shape[0])
     lp = learner_players.astype(jnp.int32)
@@ -358,7 +368,7 @@ def learner_record_from_single(
         "log_prob": sampled["log_prob"],
         "executed_mask": executed_mask,
         "target_has_bucket": target_has_bucket,
-        "bucket_valid": bucket_valid,
+        "chosen_bucket_valid": chosen_bucket_valid,
         "value": out.value,
         "reward": reward,
         "opp_reward": opp_reward,
@@ -452,24 +462,21 @@ def reset_done_envs(states: OrbitWarsState, dones_np: np.ndarray, next_seed: int
 
 
 def maybe_spawn_comets_host(states: OrbitWarsState, cfg: TrainConfig) -> OrbitWarsState:
-    from orbit_wars.comet import spawn_comet_for_state
+    from orbit_wars.step import _maybe_spawn_comet_numpy
     
     steps = np.asarray(states.step)
     COMET_SPAWN_STEPS = (50, 100, 150)
     
+    # Quick check if ANY env is at a spawn step
+    if not any(s in COMET_SPAWN_STEPS for s in steps):
+        return states
+        
     new_states_list = []
-    changed = False
     for i in range(cfg.num_envs):
         single = jax.tree_util.tree_map(lambda x: x[i], states)
-        if steps[i] in COMET_SPAWN_STEPS:
-            new_states_list.append(spawn_comet_for_state(single))
-            changed = True
-        else:
-            new_states_list.append(single)
-    
-    if changed:
-        return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *new_states_list)
-    return states
+        new_states_list.append(_maybe_spawn_comet_numpy(single))
+        
+    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *new_states_list)
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +648,9 @@ def train(cfg: TrainConfig) -> None:
         t_rollout = time.perf_counter()
         
         for _ in range(cfg.rollout_steps):
-            if active_mode != "selfplay":
-                states = maybe_spawn_comets_host(states, cfg)
+            # Always check for comet spawn (Point 4)
+            states = maybe_spawn_comets_host(states, cfg)
+            
             rng, sub = jax.random.split(rng)
             if active_mode == "selfplay":
                 states, rec, rng, learner_players = rollout_selfplay(states, params, opp_params, sub, learner_players, reset_pool)
@@ -718,7 +726,7 @@ def train(cfg: TrainConfig) -> None:
         for k in (
             "planet_features", "planet_mask",
             "target_idx", "bucket_idx", "log_prob", "executed_mask",
-            "target_has_bucket", "bucket_valid",
+            "target_has_bucket", "chosen_bucket_valid",
         ):
             flat[k] = flatten(stack_t(k, rollout_records))
         flat["old_log_prob"] = flat.pop("log_prob")

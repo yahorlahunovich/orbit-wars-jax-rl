@@ -96,16 +96,7 @@ def ref_solve_intercept(
             ix, iy = ref_predict_orbit(tx, ty, omega, turns)
             turns = ref_estimate_arrival(fx, fy, fsr, ix, iy, ttr, ships)
     
-    # Phase B: behind-sun wait (from 1100 notebook)
-    blocked = ref_path_crosses_sun(fx, fy, ix, iy, margin=SUN_PATH_MARGIN)
-    if blocked:
-        for wait_t in [2.0, 4.0, 6.0, 8.0, 10.0]:
-            px, py = ref_predict_orbit(tx, ty, omega, wait_t)
-            if not ref_path_crosses_sun(fx, fy, px, py, margin=SUN_PATH_MARGIN):
-                ix, iy = px, py
-                turns = ref_estimate_arrival(fx, fy, fsr, ix, iy, ttr, ships)
-                break
-                
+    # Note: Phase B (behind-sun wait) removed to match optimized JAX solver.
     return ix, iy, turns
 
 
