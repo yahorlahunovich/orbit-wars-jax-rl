@@ -56,7 +56,10 @@ def bucket_validity_mask(
     ship_counts: jnp.ndarray, source_ships: jnp.ndarray
 ) -> jnp.ndarray:
     src = source_ships[..., None]
-    return (ship_counts > 0.0) & (ship_counts <= src)
+    # To launch, we must have at least MIN_LAUNCH_SHIPS
+    has_enough_to_launch = src >= jnp.float32(MIN_LAUNCH_SHIPS)
+    # The calculated ship count must be <= what we actually have
+    return has_enough_to_launch & (ship_counts > 0.0) & (ship_counts <= src)
 
 
 def launch_angle(

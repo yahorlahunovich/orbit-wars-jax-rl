@@ -78,14 +78,20 @@ def joint_log_prob_and_entropy(
     executed_mask: jnp.ndarray,         # (N, P) bool
 ) -> dict[str, jnp.ndarray]:
     """Return joint log_prob, per-row entropy contributions, all masked."""
+    
+    # Identify sources that have AT LEAST ONE valid target
+    source_has_any_target = jnp.any(target_has_bucket, axis=-1)  # (N, P)
+    # Only calculate gradients for rows that actually executed AND had valid options
+    valid_mask = executed_mask & source_has_any_target
+
     tgt_lp = _masked_log_softmax(target_logits, target_has_bucket)        # (N, P, P)
     tgt_lp_sel = jnp.take_along_axis(tgt_lp, target_idx[..., None], axis=-1).squeeze(-1)
-    tgt_lp_sel = jnp.where(executed_mask, tgt_lp_sel, 0.0)
+    tgt_lp_sel = jnp.where(valid_mask, tgt_lp_sel, 0.0)
 
     # Per-source entropy of the target distribution.
     tgt_p = jnp.exp(tgt_lp) * target_has_bucket.astype(tgt_lp.dtype)
     entropy_target = -jnp.sum(tgt_p * tgt_lp, axis=-1)                    # (N, P)
-    entropy_target = jnp.where(executed_mask, entropy_target, 0.0)
+    entropy_target = jnp.where(valid_mask, entropy_target, 0.0)
 
     # Gather bucket logits for the *chosen* target.
     b_idx = jnp.arange(target_idx.shape[0])[:, None]
@@ -97,18 +103,23 @@ def joint_log_prob_and_entropy(
         target_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1),
         axis=2,
     ).squeeze(2)                                                          # (N, P, BUCKETS)
+    
+    source_has_any_bucket = jnp.any(chosen_bucket_valid, axis=-1)
+    valid_mask_bkt = valid_mask & source_has_any_bucket
+    
     bkt_lp = _masked_log_softmax(chosen_bucket_logits, chosen_bucket_valid)
     bkt_lp_sel = jnp.take_along_axis(bkt_lp, bucket_idx[..., None], axis=-1).squeeze(-1)
-    bkt_lp_sel = jnp.where(executed_mask, bkt_lp_sel, 0.0)
+    bkt_lp_sel = jnp.where(valid_mask_bkt, bkt_lp_sel, 0.0)
 
     bkt_p = jnp.exp(bkt_lp) * chosen_bucket_valid.astype(bkt_lp.dtype)
     entropy_bucket = -jnp.sum(bkt_p * bkt_lp, axis=-1)
-    entropy_bucket = jnp.where(executed_mask, entropy_bucket, 0.0)
+    entropy_bucket = jnp.where(valid_mask_bkt, entropy_bucket, 0.0)
 
     return {
         "log_prob": tgt_lp_sel + bkt_lp_sel,
         "entropy_target": entropy_target,
         "entropy_bucket": entropy_bucket,
+        "valid_mask": valid_mask_bkt, # Pass the final mask down to the loss function
     }
 
 
@@ -151,8 +162,9 @@ def policy_loss_fn(
     adv_std = jnp.std(adv_env)
     adv_norm = (adv_env - adv_mean) / jnp.maximum(adv_std, 1e-8)
     
-    executed_mask = batch["executed_mask"]
-    mask_f = executed_mask.astype(jnp.float32)
+    # Use the thoroughly cleaned mask that ignores sources with 0 valid actions.
+    valid_mask = info["valid_mask"]
+    mask_f = valid_mask.astype(jnp.float32)
     mask_count = jnp.maximum(jnp.sum(mask_f), 1.0)
 
     adv = adv_norm[:, None]
