@@ -171,6 +171,7 @@ def compose_bucket_grid(
     *,
     intercept_iterations: int = INTERCEPT_ITERATIONS,
     sun_path_margin: float = SUN_PATH_MARGIN,
+    **_kwargs,
 ) -> dict[str, jnp.ndarray]:
     """Phase 2: Compute exact angles and bucket validity for CHOSEN targets."""
     planets = state.planets

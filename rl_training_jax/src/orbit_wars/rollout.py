@@ -49,6 +49,7 @@ def sample_actions(
     deterministic: bool = False,
     intercept_iterations: int = INTERCEPT_ITERATIONS,
     sun_path_margin: float = SUN_PATH_MARGIN,
+    **kwargs,
 ) -> dict[str, jnp.ndarray]:
     """Sample (target, bucket) per source planet with split-phase grid."""
     target_mask = phase1["target_mask"]              # (B, P, P)
@@ -81,6 +82,7 @@ def sample_actions(
         compose_bucket_grid, 
         intercept_iterations=intercept_iterations,
         sun_path_margin=sun_path_margin,
+        **kwargs,
     ))(state, target_idx, phase1)
     
     chosen_bucket_valid = bucket_grid["bucket_valid"] # (B, P, BUCKETS)
