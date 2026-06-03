@@ -171,97 +171,108 @@ def predict_planet_position(
     return jnp.where(is_orbiting, px, x), jnp.where(is_orbiting, py, y)
 
 
-def predict_comet_position(
-    planet_id: jnp.ndarray,
+def precompute_comet_trajectories(
     comet_active: jnp.ndarray,
     comet_pids: jnp.ndarray,
     comet_path_index: jnp.ndarray,
     comet_paths: jnp.ndarray,
     comet_path_lengths: jnp.ndarray,
-    turns_ahead: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    planet_ids: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Precompute comet paths for all planets to avoid expensive lookups inside geometry loops.
+    
+    Returns:
+        is_comet: (P,) boolean mask
+        trajectories: (P, MAX_COMET_PATH_LEN, 2)
+    """
+    MAX_LEN = comet_paths.shape[2]
+    P = planet_ids.shape[0]
     G = comet_active.shape[0]
+    
     flat_active = jnp.repeat(comet_active, 4)
     flat_pids = comet_pids.reshape(-1)
-    flat_paths = comet_paths.reshape(-1, comet_paths.shape[2], 2)
+    flat_paths = comet_paths.reshape(-1, MAX_LEN, 2)
     flat_plens = comet_path_lengths.reshape(-1)
     flat_group_idx = jnp.repeat(jnp.arange(G), 4)
 
-    # Use argmax to find the slot, but check if found first!
-    # Important: only match if planet_id >= 0 to avoid matching padded slots
-    match_all = (flat_pids[None, ...] == planet_id[..., None]) & flat_active[None, ...] & (planet_id[..., None] >= 0)
-    best_slot = jnp.argmax(match_all.astype(jnp.int32), axis=-1)
-    found = jnp.any(match_all, axis=-1)
+    # (P, 32)
+    match_all = (flat_pids[None, :] == planet_ids[:, None]) & flat_active[None, :] & (planet_ids[:, None] >= 0)
+    best_slot = jnp.argmax(match_all.astype(jnp.int32), axis=-1)  # (P,)
+    is_comet = jnp.any(match_all, axis=-1)  # (P,)
     
     g_idx = jnp.take(flat_group_idx, best_slot)
     p_idx = best_slot 
     
-    c_path_idx = jnp.take(comet_path_index, g_idx)
-    future_idx = c_path_idx + turns_ahead.astype(jnp.int32)
-    safe_future_idx = jnp.clip(future_idx, 0, comet_paths.shape[2] - 1)
+    c_path_idx = jnp.take(comet_path_index, g_idx)  # (P,)
     
-    pos = flat_paths[p_idx.reshape(-1), safe_future_idx.reshape(-1)].reshape(planet_id.shape + (2,))
-    plen = flat_plens[p_idx]
+    # We want a tensor of shape (P, MAX_LEN, 2) that can be easily indexed by turns_ahead
+    # We can just construct it explicitly.
+    t_range = jnp.arange(MAX_LEN)[None, :]  # (1, L)
+    future_idx = c_path_idx[:, None] + t_range  # (P, L)
+    safe_future_idx = jnp.clip(future_idx, 0, MAX_LEN - 1)
     
-    valid_time = (future_idx < plen) & (future_idx >= 0)
-    return pos[..., 0], pos[..., 1], found & valid_time
+    # Extract
+    trajectories = flat_paths[p_idx[:, None], safe_future_idx]  # (P, L, 2)
+    
+    # Mask out invalid times
+    plen = flat_plens[p_idx]  # (P,)
+    valid_time = (future_idx < plen[:, None]) & (future_idx >= 0)  # (P, L)
+    
+    # Where invalid, we'll just put infinity to ensure it's not used,
+    # though it shouldn't matter if is_comet masks it.
+    # Actually, let's leave it as is, we'll mask by valid_time in the fast predictor.
+    
+    return is_comet, trajectories, valid_time
 
 
-def predict_target_position(
-    target_id: jnp.ndarray,
-    x: jnp.ndarray,
-    y: jnp.ndarray,
-    is_orbiting: jnp.ndarray,
+def predict_target_position_fast(
+    tgt_x: jnp.ndarray,
+    tgt_y: jnp.ndarray,
+    tgt_is_orbiting: jnp.ndarray,
+    tgt_is_comet: jnp.ndarray,
+    tgt_traj: jnp.ndarray,
+    tgt_valid_time: jnp.ndarray,
     turns_ahead: jnp.ndarray,
     angular_velocity: jnp.ndarray,
-    comets: Any = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    if comets is not None:
-        cx, cy, cfound = predict_comet_position(
-            target_id, comets.active, comets.planet_ids, comets.path_index,
-            comets.paths, comets.path_lengths, turns_ahead
-        )
-        ox, oy = predict_planet_position(x, y, is_orbiting, turns_ahead, angular_velocity)
-        return jnp.where(cfound, cx, ox), jnp.where(cfound, cy, oy)
-    return predict_planet_position(x, y, is_orbiting, turns_ahead, angular_velocity)
-
-
-def get_arrival_turns(
-    sx: jnp.ndarray, sy: jnp.ndarray, sr: jnp.ndarray,
-    tx: jnp.ndarray, ty: jnp.ndarray, tr: jnp.ndarray,
-    ships: jnp.ndarray, max_speed: jnp.ndarray,
-) -> jnp.ndarray:
-    d = distance_xy(sx, sy, tx, ty)
-    hit_d = jnp.maximum(0.0, d - (sr + 0.1) - tr)
-    speed = fleet_speed(ships, max_speed)
-    return jnp.maximum(1.0, jnp.ceil(hit_d / jnp.maximum(speed, 1e-6)))
+    MAX_LEN = tgt_traj.shape[-2]
+    
+    # 1. Comet path
+    safe_idx = jnp.clip(turns_ahead.astype(jnp.int32), 0, MAX_LEN - 1)
+    cx = jnp.take_along_axis(tgt_traj[..., 0], safe_idx[..., None], axis=-1).squeeze(-1)
+    cy = jnp.take_along_axis(tgt_traj[..., 1], safe_idx[..., None], axis=-1).squeeze(-1)
+    
+    # 2. Orbital path
+    ox, oy = predict_planet_position(tgt_x, tgt_y, tgt_is_orbiting, turns_ahead, angular_velocity)
+    
+    return jnp.where(tgt_is_comet, cx, ox), jnp.where(tgt_is_comet, cy, oy)
 
 
 def solve_intercept_with_wait(
     src_x: jnp.ndarray,
     src_y: jnp.ndarray,
     src_r: jnp.ndarray,
-    tgt_id: jnp.ndarray,
     tgt_x: jnp.ndarray,
     tgt_y: jnp.ndarray,
     tgt_r: jnp.ndarray,
     tgt_is_orbiting: jnp.ndarray,
+    tgt_is_comet: jnp.ndarray,
+    tgt_traj: jnp.ndarray,
+    tgt_valid_time: jnp.ndarray,
     ship_count: jnp.ndarray,
     angular_velocity: jnp.ndarray,
     max_speed: jnp.ndarray,
-    comets: Any = None,
     sun_margin: float = 1.5,
     n_iter: int = 6,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    # Ensure inputs are JAX arrays
     sx = jnp.asarray(src_x).astype(jnp.float32)
     sy = jnp.asarray(src_y).astype(jnp.float32)
     sr = jnp.asarray(src_r).astype(jnp.float32)
-    tid = jnp.asarray(tgt_id).astype(jnp.int32)
     tx = jnp.asarray(tgt_x).astype(jnp.float32)
     ty = jnp.asarray(tgt_y).astype(jnp.float32)
     tr = jnp.asarray(tgt_r).astype(jnp.float32)
     is_orb = jnp.asarray(tgt_is_orbiting).astype(jnp.bool_)
+    is_com = jnp.asarray(tgt_is_comet).astype(jnp.bool_)
     count = jnp.asarray(ship_count).astype(jnp.float32)
     speed = jnp.asarray(max_speed).astype(jnp.float32)
     
@@ -269,17 +280,17 @@ def solve_intercept_with_wait(
 
     def body(_i, carry):
         tt, _ix, _iy = carry
-        ix, iy = predict_target_position(tid, tx, ty, is_orb, tt, angular_velocity, comets)
+        ix, iy = predict_target_position_fast(tx, ty, is_orb, is_com, tgt_traj, tgt_valid_time, tt, angular_velocity)
         tt_new = get_arrival_turns(sx, sy, sr, ix, iy, tr, count, speed)
         return tt_new, ix, iy
 
-    ix0, iy0 = predict_target_position(tid, tx, ty, is_orb, turns, angular_velocity, comets)
+    ix0, iy0 = predict_target_position_fast(tx, ty, is_orb, is_com, tgt_traj, tgt_valid_time, turns, angular_velocity)
     turns, aim_x, aim_y = jax.lax.fori_loop(0, n_iter, body, (turns, ix0, iy0))
     blocked = sun_hit(sx, sy, aim_x, aim_y, margin=sun_margin)
 
     def try_future_wait(carry, wait_t):
         best_aim_x, best_aim_y, best_turns, currently_blocked = carry
-        fx, fy = predict_target_position(tid, tx, ty, is_orb, wait_t, angular_velocity, comets)
+        fx, fy = predict_target_position_fast(tx, ty, is_orb, is_com, tgt_traj, tgt_valid_time, wait_t, angular_velocity)
         f_blocked = sun_hit(sx, sy, fx, fy, margin=sun_margin)
         f_turns = get_arrival_turns(sx, sy, sr, fx, fy, tr, count, speed)
         should_update = currently_blocked & (~f_blocked)
@@ -307,8 +318,10 @@ def solve_intercept(
     n_iter: int = 25,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     aim_x, aim_y, turns, _blocked = solve_intercept_with_wait(
-        src_x, src_y, 0.0, -1, # dummy id
-        tgt_x, tgt_y, 0.0, tgt_is_orbiting, ship_count, angular_velocity, max_speed, n_iter=n_iter
+        src_x, src_y, 0.0, 
+        tgt_x, tgt_y, 0.0, tgt_is_orbiting, jnp.zeros_like(tgt_is_orbiting),
+        jnp.zeros((tgt_x.shape + (1, 2))), jnp.zeros((tgt_x.shape + (1,))),
+        ship_count, angular_velocity, max_speed, n_iter=n_iter
     )
     return aim_x, aim_y, turns
 
@@ -317,21 +330,23 @@ def estimate_intercept_angles(
     src_x: jnp.ndarray,
     src_y: jnp.ndarray,
     src_r: jnp.ndarray,
-    tgt_id: jnp.ndarray,
     tgt_x: jnp.ndarray,
     tgt_y: jnp.ndarray,
     tgt_r: jnp.ndarray,
     tgt_is_orbiting: jnp.ndarray,
+    tgt_is_comet: jnp.ndarray,
+    tgt_traj: jnp.ndarray,
+    tgt_valid_time: jnp.ndarray,
     ship_counts: jnp.ndarray,
     angular_velocity: jnp.ndarray,
     max_speed: jnp.ndarray,
-    comets: Any = None,
     n_iter: int = 6,
     sun_margin: float = 1.5,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     aim_x, aim_y, _turns, blocked = solve_intercept_with_wait(
-        src_x, src_y, src_r, tgt_id, tgt_x, tgt_y, tgt_r, tgt_is_orbiting,
-        ship_counts, angular_velocity, max_speed, comets=comets, n_iter=n_iter,
+        src_x, src_y, src_r, tgt_x, tgt_y, tgt_r, tgt_is_orbiting,
+        tgt_is_comet, tgt_traj, tgt_valid_time,
+        ship_counts, angular_velocity, max_speed, n_iter=n_iter,
         sun_margin=sun_margin,
     )
     angle = jnp.arctan2(aim_y - src_y, aim_x - src_x)

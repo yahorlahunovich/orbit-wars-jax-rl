@@ -161,13 +161,25 @@ def compose_action_grid(
     tgt_r_b = jnp.broadcast_to(radius[None, :, None], (p_count, p_count, bucket_axis))
     tgt_orb_b = jnp.broadcast_to(tgt_orbiting[None, :, None], (p_count, p_count, bucket_axis))
 
+    # Precompute comet trajectories to avoid doing it inside the geometry loops
+    from .geometry import precompute_comet_trajectories
+    is_comet, trajectories, valid_time = precompute_comet_trajectories(
+        state.comets.active, state.comets.planet_ids, state.comets.path_index,
+        state.comets.paths, state.comets.path_lengths, pids
+    )
+    
+    tgt_com_b = jnp.broadcast_to(is_comet[None, :, None], (p_count, p_count, bucket_axis))
+    tgt_traj_b = jnp.broadcast_to(trajectories[None, :, None, :, :], (p_count, p_count, bucket_axis) + trajectories.shape[1:])
+    tgt_vt_b = jnp.broadcast_to(valid_time[None, :, None, :], (p_count, p_count, bucket_axis) + valid_time.shape[1:])
+
     # Perform intercept estimation (iterative)
     angle, aim_x, aim_y, sun_blocks = estimate_intercept_angles(
         src_x_b, src_y_b, src_r_b,
-        tgt_id_b, tgt_x_b, tgt_y_b, tgt_r_b,
-        tgt_orb_b, ship_counts,
+        tgt_x_b, tgt_y_b, tgt_r_b,
+        tgt_orb_b, tgt_com_b, tgt_traj_b, tgt_vt_b,
+        ship_counts,
         state.angular_velocity, state.ship_speed,
-        comets=state.comets, n_iter=intercept_iterations,
+        n_iter=intercept_iterations,
         sun_margin=sun_path_margin,
     )
 
