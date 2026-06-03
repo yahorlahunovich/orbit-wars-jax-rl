@@ -149,9 +149,12 @@ def test_intercept_matches_heuristic_reference(seed: int):
         from orbit_wars.geometry import solve_intercept_with_wait
         jix, jiy, jtt, _jb = solve_intercept_with_wait(
             src_x=jnp.float32(fx), src_y=jnp.float32(fy), src_r=jnp.float32(fsr),
-            tgt_id=jnp.int32(-1),
             tgt_x=jnp.float32(tx), tgt_y=jnp.float32(ty), tgt_r=jnp.float32(ttr),
-            tgt_is_orbiting=jnp.bool_(orbiting), ship_count=jnp.float32(ships),
+            tgt_is_orbiting=jnp.bool_(orbiting), 
+            tgt_is_comet=jnp.bool_(False),
+            tgt_traj=jnp.zeros((1, 2), dtype=jnp.float32),
+            tgt_valid_time=jnp.zeros((1,), dtype=jnp.bool_),
+            ship_count=jnp.float32(ships),
             angular_velocity=jnp.float32(omega), max_speed=jnp.float32(MAX_SPEED),
             n_iter=6
         )
@@ -196,9 +199,12 @@ def test_orbiting_intercept_differs_from_naive_aim():
     
     angle, aim_x, aim_y, _blocked = estimate_intercept_angles(
         src_x=jnp.float32(fx), src_y=jnp.float32(fy), src_r=jnp.float32(1.0),
-        tgt_id=jnp.int32(-1),
         tgt_x=jnp.float32(tx), tgt_y=jnp.float32(ty), tgt_r=jnp.float32(1.0),
-        tgt_is_orbiting=jnp.bool_(True), ship_counts=jnp.float32(ships),
+        tgt_is_orbiting=jnp.bool_(True), 
+        tgt_is_comet=jnp.bool_(False),
+        tgt_traj=jnp.zeros((1, 2), dtype=jnp.float32),
+        tgt_valid_time=jnp.zeros((1,), dtype=jnp.bool_),
+        ship_counts=jnp.float32(ships),
         angular_velocity=jnp.float32(omega), max_speed=jnp.float32(MAX_SPEED),
     )
     lead = float(angle)

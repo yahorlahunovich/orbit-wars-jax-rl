@@ -20,7 +20,7 @@ from orbit_wars import (
     PLANET_FEATURE_DIM,
 )
 from policy import PlanetPolicy
-from ppo import compute_gae, explained_variance, ppo_loss_fn
+from ppo import compute_gae, explained_variance, policy_loss_fn
 
 
 def test_gae_terminal_zero_advantage_for_zero_reward():
@@ -108,7 +108,7 @@ def test_ppo_loss_runs_and_decreases_with_better_policy():
     }
 
     def loss_fn(p):
-        return ppo_loss_fn(p, model.apply, batch, clip_coef=0.2, vf_coef=0.5, ent_coef=0.01)
+        return policy_loss_fn(p, model.apply, batch, clip_coef=0.2, ent_coef=0.01)
 
     (l, metrics), g = jax.value_and_grad(loss_fn, has_aux=True)(params)
     assert jnp.isfinite(l)

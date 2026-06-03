@@ -239,13 +239,35 @@ def predict_target_position_fast(
     
     # 1. Comet path
     safe_idx = jnp.clip(turns_ahead.astype(jnp.int32), 0, MAX_LEN - 1)
-    cx = jnp.take_along_axis(tgt_traj[..., 0], safe_idx[..., None], axis=-1).squeeze(-1)
-    cy = jnp.take_along_axis(tgt_traj[..., 1], safe_idx[..., None], axis=-1).squeeze(-1)
+    
+    # tgt_traj is (P, P, B, MAX_LEN, 2)
+    # We want to index into the second to last dimension.
+    # We can do this efficiently by flattening the spatial dimensions.
+    orig_shape = safe_idx.shape
+    flat_idx = safe_idx.reshape(-1)
+    flat_traj = tgt_traj.reshape(-1, MAX_LEN, 2)
+    
+    # Advanced indexing:
+    flat_c = flat_traj[jnp.arange(flat_idx.shape[0]), flat_idx]
+    
+    cx = flat_c[:, 0].reshape(orig_shape)
+    cy = flat_c[:, 1].reshape(orig_shape)
     
     # 2. Orbital path
     ox, oy = predict_planet_position(tgt_x, tgt_y, tgt_is_orbiting, turns_ahead, angular_velocity)
     
     return jnp.where(tgt_is_comet, cx, ox), jnp.where(tgt_is_comet, cy, oy)
+
+
+def get_arrival_turns(
+    sx: jnp.ndarray, sy: jnp.ndarray, sr: jnp.ndarray,
+    tx: jnp.ndarray, ty: jnp.ndarray, tr: jnp.ndarray,
+    ships: jnp.ndarray, max_speed: jnp.ndarray,
+) -> jnp.ndarray:
+    d = distance_xy(sx, sy, tx, ty)
+    hit_d = jnp.maximum(0.0, d - (sr + 0.1) - tr)
+    speed = fleet_speed(ships, max_speed)
+    return jnp.maximum(1.0, jnp.ceil(hit_d / jnp.maximum(speed, 1e-6)))
 
 
 def solve_intercept_with_wait(
