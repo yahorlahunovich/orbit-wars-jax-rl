@@ -72,7 +72,7 @@ def joint_log_prob_and_entropy(
     target_logits: jnp.ndarray,         # (N, P, P)
     bucket_logits: jnp.ndarray,         # (N, P, P, BUCKETS)
     target_has_bucket: jnp.ndarray,     # (N, P, P) bool
-    bucket_valid: jnp.ndarray,          # (N, P, P, BUCKETS) bool
+    chosen_bucket_valid: jnp.ndarray,    # (N, P, BUCKETS) bool -- ONLY for the chosen target
     target_idx: jnp.ndarray,            # (N, P) int32
     bucket_idx: jnp.ndarray,            # (N, P) int32
     executed_mask: jnp.ndarray,         # (N, P) bool
@@ -98,11 +98,7 @@ def joint_log_prob_and_entropy(
     p_idx = jnp.arange(target_idx.shape[1])[None, :]
     chosen_bucket_logits = bucket_logits[b_idx, p_idx, target_idx]
 
-    chosen_bucket_valid = jnp.take_along_axis(
-        bucket_valid,
-        target_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1),
-        axis=2,
-    ).squeeze(2)                                                          # (N, P, BUCKETS)
+    # Note: chosen_bucket_valid is now passed in directly from rollout time.
     
     source_has_any_bucket = jnp.any(chosen_bucket_valid, axis=-1)
     valid_mask_bkt = valid_mask & source_has_any_bucket
@@ -146,7 +142,7 @@ def policy_loss_fn(
         target_logits=out.target_logits,
         bucket_logits=out.bucket_logits,
         target_has_bucket=batch["target_has_bucket"],
-        bucket_valid=batch["bucket_valid"],
+        chosen_bucket_valid=batch["chosen_bucket_valid"],
         target_idx=batch["target_idx"],
         bucket_idx=batch["bucket_idx"],
         executed_mask=batch["executed_mask"],

@@ -279,7 +279,20 @@ def learner_record_from_samples(
         jnp.any(grid1["full_valid"], axis=-1),
         learner_players,
     )
-    bucket_valid = _gather_by_player(grid0["full_valid"], grid1["full_valid"], learner_players)
+    
+    # Pre-gather the bucket validity mask for the *chosen* targets
+    # This reduces memory from (B, P, P, B) -> (B, P, B).
+    from .orbit_wars.decode import BUCKET_COUNT
+    def _gather_chosen_buckets(grid, sampled):
+        t_idx = sampled["target_idx"] # (B, P)
+        f_val = grid["full_valid"]     # (B, P, P, B)
+        return jnp.take_along_axis(
+            f_val, t_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
+        ).squeeze(2)
+    
+    cbv0 = _gather_chosen_buckets(grid0, s0)
+    cbv1 = _gather_chosen_buckets(grid1, s1)
+    chosen_bucket_valid = _gather_by_player(cbv0, cbv1, learner_players)
 
     reward = jnp.where(
         new_states.done & (learner_players == 0),
@@ -308,7 +321,7 @@ def learner_record_from_samples(
         "log_prob": log_prob,
         "executed_mask": executed_mask,
         "target_has_bucket": target_has_bucket,
-        "bucket_valid": bucket_valid,
+        "chosen_bucket_valid": chosen_bucket_valid,
         "value": learner_value,
         "reward": reward,
         "opp_reward": opp_reward,

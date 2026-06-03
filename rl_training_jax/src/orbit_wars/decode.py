@@ -109,6 +109,16 @@ def path_blocked_by_planets(
     tx = target_x[:, :, None]
     ty = target_y[:, :, None]
 
+    # Optimization: Bounding box check before expensive point-to-segment distance.
+    # An obstacle can only block the path if it is within the segment's bounding box.
+    x_min = jnp.minimum(sx, tx) - obs_r
+    x_max = jnp.maximum(sx, tx) + obs_r
+    y_min = jnp.minimum(sy, ty) - obs_r
+    y_max = jnp.maximum(sy, ty) + obs_r
+    
+    in_box = (ox >= x_min) & (ox <= x_max) & (oy >= y_min) & (oy <= y_max)
+    is_obstacle = is_obstacle & in_box
+
     d = point_to_segment_distance(ox, oy, sx, sy, tx, ty)
     return jnp.any((d <= obs_r) & is_obstacle, axis=2)
 
@@ -117,6 +127,8 @@ def compose_action_grid(
     state: OrbitWarsState,
     player: jnp.int32 | int,
     *,
+    incoming_me: jnp.ndarray | None = None,
+    incoming_enemy: jnp.ndarray | None = None,
     intercept_iterations: int = INTERCEPT_ITERATIONS,
     sun_path_margin: float = SUN_PATH_MARGIN,
     path_planet_margin: float = PATH_PLANET_MARGIN,
@@ -138,12 +150,13 @@ def compose_action_grid(
 
     tgt_orbiting = is_orbiting_planet(x, y, radius)
 
-    if enable_incoming_projection:
-        from .features_jax import _fleet_projections
-        incoming_me, incoming_enemy, _, _ = _fleet_projections(state, player_f)
-    else:
-        incoming_me = jnp.zeros_like(ships)
-        incoming_enemy = jnp.zeros_like(ships)
+    if incoming_me is None or incoming_enemy is None:
+        if enable_incoming_projection:
+            from .features_jax import _fleet_projections
+            incoming_me, incoming_enemy, _, _ = _fleet_projections(state, player_f)
+        else:
+            incoming_me = jnp.zeros_like(ships)
+            incoming_enemy = jnp.zeros_like(ships)
 
     src_ships_grid = ships[:, None]
     tgt_ships_grid = ships[None, :]
