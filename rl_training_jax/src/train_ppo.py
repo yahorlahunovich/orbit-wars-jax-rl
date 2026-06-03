@@ -762,7 +762,7 @@ def train(cfg: TrainConfig) -> None:
 
         ev = float(explained_variance(flat["returns"], flat["advantages"] + flat["returns"] - flat["advantages"]))  # ≈ EV(returns, returns) sanity
         # Better: compute new values on (subset of) batch — quick approximation:
-        idx = np.random.choice(n_rows, size=min(1024, n_rows), replace=False)
+        idx = np.random.choice(n_rows, size=min(cfg.minibatch_size, n_rows), replace=False)
         sub = {k: v[idx] for k, v in flat.items()}
         v_sub = model.apply(
             params,
