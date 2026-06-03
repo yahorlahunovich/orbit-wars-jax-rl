@@ -4,6 +4,8 @@ from .convert import observation_to_state, state_to_observation_dict, states_equ
 from .decode import (
     BUCKET_COUNT,
     bucket_validity_mask,
+    compose_target_grid,
+    compose_bucket_grid,
     compose_action_grid,
     launch_angle,
     pack_action_row,
@@ -47,7 +49,8 @@ __all__ = [
     "FLEET_FEATURE_DIM",
     "GLOBAL_FEATURE_DIM",
     "BUCKET_COUNT",
-    "compose_action_grid",
+    "compose_target_grid",
+    "compose_bucket_grid",
     "ship_counts_for_buckets",
     "bucket_validity_mask",
     "path_crosses_sun",

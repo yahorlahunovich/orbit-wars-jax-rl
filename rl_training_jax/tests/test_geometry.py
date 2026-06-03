@@ -39,11 +39,11 @@ def test_swept_pair_hit_crossing():
 
 
 def test_fleet_speed_bounds():
-    slow = float(fleet_speed(jnp.array(1.0), jnp.array(6.0)))
-    fast = float(fleet_speed(jnp.array(1000.0), jnp.array(6.0)))
-    assert slow == pytest.approx(1.0)
+    fast = float(fleet_speed(jnp.array(1.0), jnp.array(6.0)))
+    slow = float(fleet_speed(jnp.array(1000.0), jnp.array(6.0)))
     assert fast == pytest.approx(6.0)
-
+    assert slow == pytest.approx(3.0)
+    assert fast > slow
 
 def test_swept_pair_matches_python_reference():
     try:

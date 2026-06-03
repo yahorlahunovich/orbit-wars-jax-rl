@@ -8,151 +8,66 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from .constants import BOARD_SIZE, CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS
+from .constants import BOARD_SIZE, CENTER, SUN_RADIUS
+
+
+def _match_rank(arr: jnp.ndarray, ref: jnp.ndarray) -> jnp.ndarray:
+    """Expand arr with trailing 1-dims to match ref's rank."""
+    while arr.ndim < ref.ndim:
+        arr = arr[..., None]
+    return arr
 
 
 def distance_xy(x1: jnp.ndarray, y1: jnp.ndarray, x2: jnp.ndarray, y2: jnp.ndarray) -> jnp.ndarray:
-    return jnp.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+    dx = x1 - x2
+    dy = y1 - y2
+    return jnp.sqrt(dx * dx + dy * dy)
+
+
+def in_bounds(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    return (x >= 0) & (x <= BOARD_SIZE) & (y >= 0) & (y <= BOARD_SIZE)
 
 
 def point_to_segment_distance(
     px: jnp.ndarray,
     py: jnp.ndarray,
-    ax: jnp.ndarray,
-    ay: jnp.ndarray,
-    bx: jnp.ndarray,
-    by: jnp.ndarray,
+    x1: jnp.ndarray,
+    y1: jnp.ndarray,
+    x2: jnp.ndarray,
+    y2: jnp.ndarray,
 ) -> jnp.ndarray:
-    dx = bx - ax
-    dy = by - ay
-    denom = dx * dx + dy * dy
-    t = jnp.where(
-        denom > 0.0,
-        ((px - ax) * dx + (py - ay) * dy) / denom,
-        0.0,
-    )
+    """Distance from point(s) (px, py) to line segment(s) (x1, y1) -> (x2, y2)."""
+    dx = x2 - x1
+    dy = y2 - y1
+    d2 = dx * dx + dy * dy
+
+    # Projection of point onto line (normalized to [0, 1])
+    t = ((px - x1) * dx + (py - y1) * dy) / jnp.maximum(d2, 1e-12)
     t = jnp.clip(t, 0.0, 1.0)
-    cx = ax + t * dx
-    cy = ay + t * dy
-    return jnp.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+
+    # Closest point on segment
+    closest_x = x1 + t * dx
+    closest_y = y1 + t * dy
+
+    return distance_xy(px, py, closest_x, closest_y)
 
 
-def swept_pair_hit(
-    ax: jnp.ndarray,
-    ay: jnp.ndarray,
-    bx: jnp.ndarray,
-    by: jnp.ndarray,
-    p0x: jnp.ndarray,
-    p0y: jnp.ndarray,
-    p1x: jnp.ndarray,
-    p1y: jnp.ndarray,
-    radius: jnp.ndarray,
+def sun_hit(
+    x1: jnp.ndarray, y1: jnp.ndarray, x2: jnp.ndarray, y2: jnp.ndarray, margin: float = 1.0
 ) -> jnp.ndarray:
-    # ax, ay, bx, by: fleet start/end
-    # p0x, p0y, p1x, p1y: planet start/end
-    
-    # Optimization: AABB pre-check
-    f_min_x = jnp.minimum(ax, bx)
-    f_max_x = jnp.maximum(ax, bx)
-    f_min_y = jnp.minimum(ay, by)
-    f_max_y = jnp.maximum(ay, by)
-    
-    p_min_x = jnp.minimum(p0x, p1x) - radius
-    p_max_x = jnp.maximum(p0x, p1x) + radius
-    p_min_y = jnp.minimum(p0y, p1y) - radius
-    p_max_y = jnp.maximum(p0y, p1y) + radius
-    
-    intersect = (f_min_x <= p_max_x) & (f_max_x >= p_min_x) & \
-                (f_min_y <= p_max_y) & (f_max_y >= p_min_y)
-
-    d0x = ax - p0x
-    d0y = ay - p0y
-    dvx = (bx - ax) - (p1x - p0x)
-    dvy = (by - ay) - (p1y - p0y)
-    a = dvx * dvx + dvy * dvy
-    b = 2.0 * (d0x * dvx + d0y * dvy)
-    c = d0x * d0x + d0y * d0y - radius * radius
-    disc = b * b - 4.0 * a * c
-    no_motion = a < 1e-12
-    hit_no_motion = c <= 0.0
-    sq = jnp.sqrt(jnp.maximum(disc, 0.0))
-    t1 = (-b - sq) / (2.0 * a + 1e-12)
-    t2 = (-b + sq) / (2.0 * a + 1e-12)
-    hit_motion = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
-    return intersect & jnp.where(no_motion, hit_no_motion, hit_motion)
+    """Does the path from (x1, y1) to (x2, y2) hit the sun?"""
+    d = point_to_segment_distance(
+        jnp.float32(CENTER), jnp.float32(CENTER), x1, y1, x2, y2
+    )
+    return d <= (SUN_RADIUS + margin)
 
 
-def fleet_speed(ships: jnp.ndarray, max_speed: jnp.ndarray) -> jnp.ndarray:
-    log_ships = jnp.log(jnp.maximum(ships, 1.0))
-    log1000 = jnp.log(1000.0)
-    ratio = jnp.clip(log_ships / log1000, 0.0, 1.0)
-    speed = 1.0 + (max_speed - 1.0) * (ratio ** 1.5)
-    return speed
-
-
-def sun_hit(old_x, old_y, new_x, new_y, margin: float = 0.0) -> jnp.ndarray:
-    return point_to_segment_distance(
-        jnp.float32(CENTER), jnp.float32(CENTER), old_x, old_y, new_x, new_y,
-    ) < (SUN_RADIUS + margin)
-
-
-def segment_intersects_circle(
-    ax: jnp.ndarray,
-    ay: jnp.ndarray,
-    bx: jnp.ndarray,
-    by: jnp.ndarray,
-    cx: jnp.ndarray,
-    cy: jnp.ndarray,
-    radius: jnp.ndarray,
-) -> jnp.ndarray:
-    d = point_to_segment_distance(cx, cy, ax, ay, bx, by)
-    return d <= radius
-
-
-def segment_clear_of_circles(
-    ax: jnp.ndarray,
-    ay: jnp.ndarray,
-    bx: jnp.ndarray,
-    by: jnp.ndarray,
-    cx: jnp.ndarray,
-    cy: jnp.ndarray,
-    radius: jnp.ndarray,
-    valid: jnp.ndarray,
-) -> jnp.ndarray:
-    blocked = segment_intersects_circle(ax, ay, bx, by, cx, cy, radius)
-    return ~jnp.any(blocked & valid, axis=-1)
-
-
-def _angle_diff(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
-    dd = (a - b) % (2.0 * jnp.pi)
-    return jnp.minimum(dd, 2.0 * jnp.pi - dd)
-
-
-def safe_angle(
-    src_x: jnp.ndarray,
-    src_y: jnp.ndarray,
-    aim_x: jnp.ndarray,
-    aim_y: jnp.ndarray,
-    sun_margin: float = 1.5,
-) -> jnp.ndarray:
-    src_x = jnp.asarray(src_x).astype(jnp.float32)
-    src_y = jnp.asarray(src_y).astype(jnp.float32)
-    aim_x = jnp.asarray(aim_x).astype(jnp.float32)
-    aim_y = jnp.asarray(aim_y).astype(jnp.float32)
-    margin = jnp.float32(sun_margin)
-    sun_r = jnp.float32(SUN_RADIUS)
-    center = jnp.float32(CENTER)
-
-    direct = jnp.arctan2(aim_y - src_y, aim_x - src_x)
-    crosses = sun_hit(src_x, src_y, aim_x, aim_y, margin=float(sun_margin))
-    d = jnp.sqrt((src_x - center) ** 2 + (src_y - center) ** 2)
-    inside = d <= sun_r + 1.0
-    half = jnp.arcsin(jnp.minimum(1.0, (sun_r + margin) / jnp.maximum(d, 1e-6)))
-    to_sun = jnp.arctan2(center - src_y, center - src_x)
-    cw = to_sun + half
-    ccw = to_sun - half
-    detour = jnp.where(_angle_diff(cw, direct) <= _angle_diff(ccw, direct), cw, ccw)
-    return jnp.where(crosses & ~inside, detour, direct).astype(jnp.float32)
+def is_orbiting_planet(x: jnp.ndarray, y: jnp.ndarray, r: jnp.ndarray) -> jnp.ndarray:
+    dx = x - CENTER
+    dy = y - CENTER
+    d = jnp.sqrt(dx * dx + dy * dy)
+    # Match the threshold used in the official env (ROTATION_RADIUS_LIMIT = 50)
+    return d + r < 50.0
 
 
 def predict_orbit_polar(
@@ -161,20 +76,20 @@ def predict_orbit_polar(
     angular_velocity: jnp.ndarray,
     turns_ahead: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    theta = jnp.arctan2(y - CENTER, x - CENTER)
-    r = jnp.sqrt((x - CENTER) ** 2 + (y - CENTER) ** 2)
-    theta2 = theta + angular_velocity * turns_ahead
-    nx, ny = CENTER + r * jnp.cos(theta2), CENTER + r * jnp.sin(theta2)
-    return nx, ny
+    dx = x - CENTER
+    dy = y - CENTER
+    theta = jnp.arctan2(dy, dx)
+    orbit_r = jnp.sqrt(dx * dx + dy * dy)
+    
+    # Broadcast to match turns_ahead rank
+    theta = _match_rank(theta, turns_ahead)
+    orbit_r = _match_rank(orbit_r, turns_ahead)
+    omega = _match_rank(angular_velocity, turns_ahead)
 
-
-def in_bounds(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    return (x >= 0.0) & (x <= BOARD_SIZE) & (y >= 0.0) & (y <= BOARD_SIZE)
-
-
-def is_orbiting_planet(x: jnp.ndarray, y: jnp.ndarray, radius: jnp.ndarray) -> jnp.ndarray:
-    orbit_r = jnp.sqrt((x - CENTER) ** 2 + (y - CENTER) ** 2)
-    return orbit_r + radius < ROTATION_RADIUS_LIMIT
+    theta2 = theta + omega * turns_ahead
+    new_x = CENTER + orbit_r * jnp.cos(theta2)
+    new_y = CENTER + orbit_r * jnp.sin(theta2)
+    return new_x, new_y
 
 
 def predict_planet_position(
@@ -185,7 +100,11 @@ def predict_planet_position(
     angular_velocity: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     px, py = predict_orbit_polar(x, y, angular_velocity, turns_ahead)
-    return jnp.where(is_orbiting, px, x), jnp.where(is_orbiting, py, y)
+    # Broadcast is_orbiting to match
+    orb = _match_rank(is_orbiting, turns_ahead)
+    xx = _match_rank(x, turns_ahead)
+    yy = _match_rank(y, turns_ahead)
+    return jnp.where(orb, px, xx), jnp.where(orb, py, yy)
 
 
 def precompute_comet_trajectories(
@@ -195,13 +114,7 @@ def precompute_comet_trajectories(
     comet_paths: jnp.ndarray,
     comet_path_lengths: jnp.ndarray,
     planet_ids: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Precompute comet paths for all planets to avoid expensive lookups inside geometry loops.
-    
-    Returns:
-        is_comet: (P,) boolean mask
-        trajectories: (P, MAX_COMET_PATH_LEN, 2)
-    """
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     MAX_LEN = comet_paths.shape[2]
     P = planet_ids.shape[0]
     G = comet_active.shape[0]
@@ -212,7 +125,6 @@ def precompute_comet_trajectories(
     flat_plens = comet_path_lengths.reshape(-1)
     flat_group_idx = jnp.repeat(jnp.arange(G), 4)
 
-    # (P, 32)
     match_all = (flat_pids[None, :] == planet_ids[:, None]) & flat_active[None, :] & (planet_ids[:, None] >= 0)
     best_slot = jnp.argmax(match_all.astype(jnp.int32), axis=-1)  # (P,)
     is_comet = jnp.any(match_all, axis=-1)  # (P,)
@@ -222,22 +134,13 @@ def precompute_comet_trajectories(
     
     c_path_idx = jnp.take(comet_path_index, g_idx)  # (P,)
     
-    # We want a tensor of shape (P, MAX_LEN, 2) that can be easily indexed by turns_ahead
-    # We can just construct it explicitly.
     t_range = jnp.arange(MAX_LEN)[None, :]  # (1, L)
     future_idx = c_path_idx[:, None] + t_range  # (P, L)
     safe_future_idx = jnp.clip(future_idx, 0, MAX_LEN - 1)
     
-    # Extract
     trajectories = flat_paths[p_idx[:, None], safe_future_idx]  # (P, L, 2)
-    
-    # Mask out invalid times
     plen = flat_plens[p_idx]  # (P,)
     valid_time = (future_idx < plen[:, None]) & (future_idx >= 0)  # (P, L)
-    
-    # Where invalid, we'll just put infinity to ensure it's not used,
-    # though it shouldn't matter if is_comet masks it.
-    # Actually, let's leave it as is, we'll mask by valid_time in the fast predictor.
     
     return is_comet, trajectories, valid_time
 
@@ -253,22 +156,21 @@ def predict_target_position_fast(
     angular_velocity: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     MAX_LEN = tgt_traj.shape[-2]
-    
-    # 1. Comet path
     safe_idx = jnp.clip(turns_ahead.astype(jnp.int32), 0, MAX_LEN - 1)
     
-    # tgt_traj is (..., MAX_LEN, 2)
-    # safe_idx is (...)
-    idx = safe_idx[..., None, None] # (..., 1, 1)
-    idx = jnp.broadcast_to(idx, safe_idx.shape + (1, 2)) # (..., 1, 2)
-    c = jnp.take_along_axis(tgt_traj, idx, axis=-2) # (..., 1, 2)
-    cx = c[..., 0, 0]
-    cy = c[..., 0, 1]
+    orig_shape = safe_idx.shape
+    flat_idx = safe_idx.reshape(-1)
+    flat_traj = tgt_traj.reshape(-1, MAX_LEN, 2)
+    
+    res = flat_traj[jnp.arange(flat_idx.shape[0]), flat_idx]
+    cx = res[:, 0].reshape(orig_shape)
+    cy = res[:, 1].reshape(orig_shape)
     
     # 2. Orbital path
     ox, oy = predict_planet_position(tgt_x, tgt_y, tgt_is_orbiting, turns_ahead, angular_velocity)
     
-    return jnp.where(tgt_is_comet, cx, ox), jnp.where(tgt_is_comet, cy, oy)
+    is_com = _match_rank(tgt_is_comet, turns_ahead)
+    return jnp.where(is_com, cx, ox), jnp.where(is_com, cy, oy)
 
 
 def get_arrival_turns(
@@ -277,9 +179,14 @@ def get_arrival_turns(
     ships: jnp.ndarray, max_speed: jnp.ndarray,
 ) -> jnp.ndarray:
     d = distance_xy(sx, sy, tx, ty)
+    tr = _match_rank(tr, d)
+    sr = _match_rank(sr, d)
+    
     hit_d = jnp.maximum(0.0, d - (sr + 0.1) - tr)
     speed = fleet_speed(ships, max_speed)
-    return jnp.maximum(1.0, jnp.ceil(hit_d / jnp.maximum(speed, 1e-6)))
+    
+    hit_d_b = _match_rank(hit_d, speed)
+    return jnp.maximum(1.0, jnp.ceil(hit_d_b / jnp.maximum(speed, 1e-6)))
 
 
 def solve_intercept_with_wait(
@@ -320,11 +227,11 @@ def solve_intercept_with_wait(
 
     ix0, iy0 = predict_target_position_fast(tx, ty, is_orb, is_com, tgt_traj, tgt_valid_time, turns, angular_velocity)
     turns, aim_x, aim_y = jax.lax.fori_loop(0, n_iter, body, (turns, ix0, iy0))
-    blocked = sun_hit(sx, sy, aim_x, aim_y, margin=sun_margin)
-
-    # Note: O(P^3) wait logic removed. The RL agent naturally learns to wait (NOOP)
-    # when the direct path is currently blocked by the sun.
     
+    sx_b = _match_rank(sx, aim_x)
+    sy_b = _match_rank(sy, aim_y)
+    blocked = sun_hit(sx_b, sy_b, aim_x, aim_y, margin=sun_margin)
+
     return aim_x, aim_y, turns, blocked
 
 
@@ -337,7 +244,7 @@ def solve_intercept(
     ship_count: jnp.ndarray,
     angular_velocity: jnp.ndarray,
     max_speed: jnp.ndarray,
-    n_iter: int = 65,
+    n_iter: int = 25,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     aim_x, aim_y, turns, _blocked = solve_intercept_with_wait(
         src_x, src_y, 0.0, 
@@ -373,3 +280,51 @@ def estimate_intercept_angles(
     )
     angle = jnp.arctan2(aim_y - src_y, aim_x - src_x)
     return angle, aim_x, aim_y, blocked
+
+
+def swept_pair_hit(
+    ax: jnp.ndarray,
+    ay: jnp.ndarray,
+    bx: jnp.ndarray,
+    by: jnp.ndarray,
+    p0x: jnp.ndarray,
+    p0y: jnp.ndarray,
+    p1x: jnp.ndarray,
+    p1y: jnp.ndarray,
+    radius: jnp.ndarray,
+) -> jnp.ndarray:
+    f_min_x = jnp.minimum(ax, bx)
+    f_max_x = jnp.maximum(ax, bx)
+    f_min_y = jnp.minimum(ay, by)
+    f_max_y = jnp.maximum(ay, by)
+    
+    p_min_x = jnp.minimum(p0x, p1x) - radius
+    p_max_x = jnp.maximum(p0x, p1x) + radius
+    p_min_y = jnp.minimum(p0y, p1y) - radius
+    p_max_y = jnp.maximum(p0y, p1y) + radius
+    
+    intersect = (f_min_x <= p_max_x) & (f_max_x >= p_min_x) & \
+                (f_min_y <= p_max_y) & (f_max_y >= p_min_y)
+
+    d0x = ax - p0x
+    d0y = ay - p0y
+    dvx = (bx - ax) - (p1x - p0x)
+    dvy = (by - ay) - (p1y - p0y)
+    a = dvx * dvx + dvy * dvy
+    b = 2.0 * (d0x * dvx + d0y * dvy)
+    c = d0x * d0x + d0y * d0y - radius * radius
+    disc = b * b - 4.0 * a * c
+    no_motion = a < 1e-12
+    hit_no_motion = c <= 0.0
+    sq = jnp.sqrt(jnp.maximum(disc, 0.0))
+    t1 = (-b - sq) / (2.0 * a + 1e-12)
+    t2 = (-b + sq) / (2.0 * a + 1e-12)
+    hit_motion = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
+    return intersect & jnp.where(no_motion, hit_no_motion, hit_motion)
+
+
+def fleet_speed(ships: jnp.ndarray, max_speed: jnp.ndarray) -> jnp.ndarray:
+    log_ships = jnp.log(jnp.maximum(ships, 1.0))
+    log1000 = jnp.log(1000.0)
+    speed = max_speed * (1.0 - 0.5 * jnp.minimum(1.0, log_ships / log1000))
+    return jnp.maximum(speed, 1.0)

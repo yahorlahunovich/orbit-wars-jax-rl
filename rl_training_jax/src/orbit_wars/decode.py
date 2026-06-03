@@ -1,81 +1,58 @@
-"""Pure-JAX geometry decoder for Orbit Wars actions.
-Updated to match the 1100 ELO heuristic notebook's trajectory logic.
+"""Action decoding and grid composition for Orbit Wars.
+Splits composition into two phases (Target Phase and Bucket Phase) to avoid
+expensive O(P*P*B) calculations and huge intermediate tensors.
 """
 
 from __future__ import annotations
 
+import functools
 import jax
 import jax.numpy as jnp
 
-from .constants import CENTER, SUN_RADIUS
+from .constants import (
+    MIN_LAUNCH_SHIPS,
+    PATH_PLANET_MARGIN,
+    SUN_PATH_MARGIN,
+    INTERCEPT_ITERATIONS,
+    BUCKET_COUNT,
+)
 from .geometry import (
-    estimate_intercept_angles,
     is_orbiting_planet,
     point_to_segment_distance,
-    safe_angle,
-    sun_hit,
+    estimate_intercept_angles,
 )
 from .state import OrbitWarsState
 
-BUCKET_COUNT = 8
-MIN_LAUNCH_SHIPS = 4
-SUN_PATH_MARGIN = 1.5
-PATH_PLANET_MARGIN = 1.0
-INTERCEPT_ITERATIONS = 6  # Match notebook
-
-
-# Launch offset to avoid spawning fleets inside the source planet.
-LAUNCH_OFFSET_PADDING = 0.1
-
 
 def ship_counts_for_buckets(
-    source_ships: jnp.ndarray, target_ships: jnp.ndarray, incoming_me: jnp.ndarray, incoming_enemy: jnp.ndarray
+    src_ships: jnp.ndarray, # (...)
+    tgt_ships: jnp.ndarray, # (...)
+    inc_me: jnp.ndarray,    # (...)
+    inc_en: jnp.ndarray,    # (...)
 ) -> jnp.ndarray:
-    """Return integer-valued ship counts for every bucket index."""
-    src = source_ships[..., None]
-    tgt = target_ships[..., None]
-    inc_me = incoming_me[..., None]
-    inc_en = incoming_enemy[..., None]
+    """Return an array of ship counts for each of the 8 buckets."""
+    b0 = src_ships * 0.10
+    b1 = src_ships * 0.25
+    b2 = src_ships * 0.33
+    b3 = src_ships * 0.50
+    b4 = src_ships * 1.00
     
-    b0 = src * 0.25
-    b1 = src * 0.50
-    b2 = src * 0.75
-    b3 = src * 1.00
-    b4 = tgt + 1.0
-    b5 = tgt + src * 0.50
-    b6 = jnp.maximum(0.0, tgt + inc_en - inc_me) + 1.0
-    b7 = jnp.maximum(0.0, tgt + inc_en - inc_me) + src * 0.25
+    needed = jnp.maximum(0.0, tgt_ships + inc_en - inc_me)
+    b5 = needed + 1.0
+    b6 = needed + 5.0
+    b7 = needed + 10.0
     
-    b0, b1, b2, b3, b4, b5, b6, b7 = jnp.broadcast_arrays(b0, b1, b2, b3, b4, b5, b6, b7)
-    raw = jnp.concatenate([b0, b1, b2, b3, b4, b5, b6, b7], axis=-1)
-    raw = jnp.maximum(raw, jnp.float32(MIN_LAUNCH_SHIPS))
-    return jnp.floor(raw)
+    bs = jnp.broadcast_arrays(b0, b1, b2, b3, b4, b5, b6, b7)
+    counts = jnp.stack(bs, axis=-1)
+    return jnp.clip(jnp.floor(counts), 1.0, jnp.maximum(1.0, src_ships[..., None]))
 
 
 def bucket_validity_mask(
     ship_counts: jnp.ndarray, source_ships: jnp.ndarray
 ) -> jnp.ndarray:
     src = source_ships[..., None]
-    # To launch, we must have at least MIN_LAUNCH_SHIPS
     has_enough_to_launch = src >= jnp.float32(MIN_LAUNCH_SHIPS)
-    # The calculated ship count must be <= what we actually have
     return has_enough_to_launch & (ship_counts > 0.0) & (ship_counts <= src)
-
-
-def launch_angle(
-    src_x: jnp.ndarray, src_y: jnp.ndarray,
-    tgt_x: jnp.ndarray, tgt_y: jnp.ndarray,
-    margin: float = SUN_PATH_MARGIN,
-) -> jnp.ndarray:
-    return safe_angle(src_x, src_y, tgt_x, tgt_y, sun_margin=margin)
-
-
-def path_crosses_sun(
-    src_x: jnp.ndarray, src_y: jnp.ndarray,
-    tgt_x: jnp.ndarray, tgt_y: jnp.ndarray,
-    margin: float = 0.0,
-) -> jnp.ndarray:
-    return sun_hit(src_x, src_y, tgt_x, tgt_y, margin=margin)
 
 
 def path_blocked_by_planets(
@@ -89,52 +66,50 @@ def path_blocked_by_planets(
     planet_active: jnp.ndarray,
     margin: float = PATH_PLANET_MARGIN,
 ) -> jnp.ndarray:
-    p = planet_x.shape[0]
-    slot = jnp.arange(p)
-    src_i = slot[:, None, None]
-    tgt_i = slot[None, :, None]
-    obs_i = slot[None, None, :]
+    ox = planet_x
+    oy = planet_y
+    obs_r = planet_radius + margin
+    is_obstacle = planet_active
 
-    is_obstacle = (
-        planet_active[None, None, :]
-        & (obs_i != src_i)
-        & (obs_i != tgt_i)
-    )
-    obs_r = (planet_radius + margin)[None, None, :]
-    ox = planet_x[None, None, :]
-    oy = planet_y[None, None, :]
+    for _ in range(start_x.ndim):
+        ox = ox[None, ...]
+        oy = oy[None, ...]
+        obs_r = obs_r[None, ...]
+        is_obstacle = is_obstacle[None, ...]
 
-    sx = start_x[:, :, None]
-    sy = start_y[:, :, None]
-    tx = target_x[:, :, None]
-    ty = target_y[:, :, None]
+    sx = start_x[..., None]
+    sy = start_y[..., None]
+    tx = target_x[..., None]
+    ty = target_y[..., None]
 
-    # Optimization: Bounding box check before expensive point-to-segment distance.
-    # An obstacle can only block the path if it is within the segment's bounding box.
     x_min = jnp.minimum(sx, tx) - obs_r
     x_max = jnp.maximum(sx, tx) + obs_r
     y_min = jnp.minimum(sy, ty) - obs_r
     y_max = jnp.maximum(sy, ty) + obs_r
     
     in_box = (ox >= x_min) & (ox <= x_max) & (oy >= y_min) & (oy <= y_max)
-    is_obstacle = is_obstacle & in_box
-
     d = point_to_segment_distance(ox, oy, sx, sy, tx, ty)
-    return jnp.any((d <= obs_r) & is_obstacle, axis=2)
+    
+    # Ignore obstacles at the exact start or end point (self)
+    d_start = jnp.sqrt((ox - sx)**2 + (oy - sy)**2)
+    d_target = jnp.sqrt((ox - tx)**2 + (oy - ty)**2)
+    is_not_self = (d_start > 1e-3) & (d_target > 1e-3)
+    
+    return jnp.any((d <= obs_r) & is_obstacle & is_not_self, axis=-1)
 
 
-def compose_action_grid(
+def compose_target_grid(
     state: OrbitWarsState,
     player: jnp.int32 | int,
+    incoming_me: jnp.ndarray,
+    incoming_enemy: jnp.ndarray,
     *,
-    incoming_me: jnp.ndarray | None = None,
-    incoming_enemy: jnp.ndarray | None = None,
     intercept_iterations: int = INTERCEPT_ITERATIONS,
     sun_path_margin: float = SUN_PATH_MARGIN,
     path_planet_margin: float = PATH_PLANET_MARGIN,
     enable_planet_block: bool = True,
-    enable_incoming_projection: bool = True,
 ) -> dict[str, jnp.ndarray]:
+    """Phase 1: Compute which (source, target) pairs are potentially valid."""
     planets = state.planets
     active = planets[:, 7] > 0.0
     owner = planets[:, 1]
@@ -142,111 +117,183 @@ def compose_action_grid(
     source_valid = active & (owner == player_f)
     target_valid = active
 
-    x = planets[:, 2]
-    y = planets[:, 3]
-    radius = planets[:, 4]
-    ships = planets[:, 5]
-    pids = planets[:, 0].astype(jnp.int32)
+    x, y, radius, ships, pids = planets[:, 2], planets[:, 3], planets[:, 4], planets[:, 5], planets[:, 0].astype(jnp.int32)
 
     tgt_orbiting = is_orbiting_planet(x, y, radius)
-
-    if incoming_me is None or incoming_enemy is None:
-        if enable_incoming_projection:
-            from .features_jax import _fleet_projections
-            incoming_me, incoming_enemy, _, _ = _fleet_projections(state, player_f)
-        else:
-            incoming_me = jnp.zeros_like(ships)
-            incoming_enemy = jnp.zeros_like(ships)
-
-    src_ships_grid = ships[:, None]
-    tgt_ships_grid = ships[None, :]
-    inc_me_grid = incoming_me[None, :]
-    inc_en_grid = incoming_enemy[None, :]
-    ship_counts = ship_counts_for_buckets(src_ships_grid, tgt_ships_grid, inc_me_grid, inc_en_grid)
-
-    p_count = planets.shape[0]
-    bucket_axis = ship_counts.shape[-1]
+    # Representative ships (P,)
+    rep_ships = jnp.maximum(1.0, jnp.floor(ships * 0.5))
     
-    src_x_b = x[:, None, None]
-    src_y_b = y[:, None, None]
-    src_r_b = radius[:, None, None]
-    
-    tgt_x_b = x[None, :, None]
-    tgt_y_b = y[None, :, None]
-    tgt_r_b = radius[None, :, None]
-    tgt_orb_b = tgt_orbiting[None, :, None]
-
-    # Precompute comet trajectories to avoid doing it inside the geometry loops
     from .geometry import precompute_comet_trajectories
     is_comet, trajectories, valid_time = precompute_comet_trajectories(
         state.comets.active, state.comets.planet_ids, state.comets.path_index,
         state.comets.paths, state.comets.path_lengths, pids
     )
     
-    tgt_com_b = is_comet[None, :, None]
-    tgt_traj_b = trajectories[None, :, None, :, :]  # (1, P, 1, L, 2)
-    tgt_vt_b = valid_time[None, :, None, :]  # (1, P, 1, L)
+    def _row_intercept(sx, sy, sr):
+        # We want to check all targets (P,) for this one source.
+        # Outputs (P,) tensors.
+        return estimate_intercept_angles(
+            sx, sy, sr, x, y, radius, tgt_orbiting, is_comet, 
+            trajectories, valid_time, rep_ships,
+            state.angular_velocity, state.ship_speed,
+            n_iter=intercept_iterations, sun_margin=sun_path_margin,
+        )
 
-    # Perform intercept estimation (iterative)
-    # JAX will automatically broadcast (P, 1, 1), (1, P, 1), and (P, P, B) arrays internally.
-    angle, aim_x, aim_y, sun_blocks = estimate_intercept_angles(
-        src_x_b, src_y_b, src_r_b,
-        tgt_x_b, tgt_y_b, tgt_r_b,
-        tgt_orb_b, tgt_com_b, tgt_traj_b, tgt_vt_b,
-        ship_counts,
-        state.angular_velocity, state.ship_speed,
-        n_iter=intercept_iterations,
-        sun_margin=sun_path_margin,
-    )
+    angle, aim_x, aim_y, sun_blocks = jax.vmap(_row_intercept)(x, y, radius)
 
     if enable_planet_block:
-        center_x_2d = jnp.broadcast_to(x[:, None], (p_count, p_count))
-        center_y_2d = jnp.broadcast_to(y[:, None], (p_count, p_count))
-        tgt_x_2d = jnp.broadcast_to(x[None, :], (p_count, p_count))
-        tgt_y_2d = jnp.broadcast_to(y[None, :], (p_count, p_count))
-        pb_2d = path_blocked_by_planets(
-            center_x_2d, center_y_2d, tgt_x_2d, tgt_y_2d, x, y, radius, active, margin=path_planet_margin,
+        planet_blocks = path_blocked_by_planets(
+            x[:, None], y[:, None], x[None, :], y[None, :], x, y, radius, active, margin=path_planet_margin,
         )
-        planet_blocks = jnp.broadcast_to(pb_2d[:, :, None], (p_count, p_count, bucket_axis))
     else:
-        planet_blocks = jnp.zeros_like(sun_blocks, dtype=jnp.bool_)
+        planet_blocks = jnp.zeros((planets.shape[0], planets.shape[0]), dtype=jnp.bool_)
 
-    self_target = jnp.eye(p_count, dtype=jnp.bool_)
     pair_valid = source_valid[:, None] & target_valid[None, :]
+    has_enough = (ships >= jnp.float32(MIN_LAUNCH_SHIPS))
+    target_mask = pair_valid & has_enough[:, None] & (~sun_blocks) & (~planet_blocks)
 
-    bucket_valid = bucket_validity_mask(ship_counts, src_ships_grid)
+    return {
+        "source_valid_any": jnp.any(target_mask, axis=-1),
+        "target_mask": target_mask,
+        "from_ids": pids,
+        "is_comet": is_comet,
+        "trajectories": trajectories,
+        "valid_time": valid_time,
+        "incoming_me": incoming_me,
+        "incoming_enemy": incoming_enemy,
+    }
+
+
+def compose_bucket_grid(
+    state: OrbitWarsState,
+    target_idx: jnp.ndarray, # (P,) chosen target per source
+    phase1_results: dict,
+    *,
+    intercept_iterations: int = INTERCEPT_ITERATIONS,
+    sun_path_margin: float = SUN_PATH_MARGIN,
+) -> dict[str, jnp.ndarray]:
+    """Phase 2: Compute exact angles and bucket validity for CHOSEN targets."""
+    planets = state.planets
+    x, y, radius, ships = planets[:, 2], planets[:, 3], planets[:, 4], planets[:, 5]
+    
+    tx = x[target_idx]
+    ty = y[target_idx]
+    tr = radius[target_idx]
+    torb = is_orbiting_planet(tx, ty, tr)
+    tcom = phase1_results["is_comet"][target_idx]
+    ttraj = phase1_results["trajectories"][target_idx]
+    tvt = phase1_results["valid_time"][target_idx]
+    
+    tgt_ships = ships[target_idx]
+    inc_me = phase1_results["incoming_me"][target_idx]
+    inc_en = phase1_results["incoming_enemy"][target_idx]
+    
+    # ship_counts: (P, B)
+    ship_counts = ship_counts_for_buckets(ships, tgt_ships, inc_me, inc_en)
+    
+    def _bucket_intercept(sx, sy, sr, tx, ty, tr, torb, tcom, ttraj, tvt, sc):
+        # All inputs are scalars except sc which is (B,)
+        # Returns (B,) tensors.
+        return estimate_intercept_angles(
+            sx, sy, sr, tx, ty, tr, torb, tcom, ttraj, tvt, sc,
+            state.angular_velocity, state.ship_speed,
+            n_iter=intercept_iterations, sun_margin=sun_path_margin,
+        )
+
+    angle, aim_x, aim_y, sun_blocks = jax.vmap(_bucket_intercept)(
+        x, y, radius, tx, ty, tr, torb, tcom, ttraj, tvt, ship_counts
+    )
+    
+    bucket_valid = bucket_validity_mask(ship_counts, ships) & (~sun_blocks)
+    
+    return {
+        "angle": angle,
+        "ship_counts": ship_counts,
+        "bucket_valid": bucket_valid,
+    }
+
+
+def compose_full_grid(
+    state: OrbitWarsState,
+    player: jnp.int32 | int,
+    incoming_me: jnp.ndarray | None = None,
+    incoming_enemy: jnp.ndarray | None = None,
+    *,
+    intercept_iterations: int = INTERCEPT_ITERATIONS,
+    sun_path_margin: float = SUN_PATH_MARGIN,
+    path_planet_margin: float = PATH_PLANET_MARGIN,
+    enable_planet_block: bool = True,
+) -> dict[str, jnp.ndarray]:
+    """Compatibility: Builds the full (P, P, B) grid. SLOW."""
+    planets = state.planets
+    active = planets[:, 7] > 0.0
+    owner = planets[:, 1]
+    player_f = jnp.float32(player)
+    source_valid = active & (owner == player_f)
+    target_valid = active
+    x, y, radius, ships, pids = planets[:, 2], planets[:, 3], planets[:, 4], planets[:, 5], planets[:, 0].astype(jnp.int32)
+
+    if incoming_me is None or incoming_enemy is None:
+        from .features_jax import _fleet_projections
+        incoming_me, incoming_enemy, _, _ = _fleet_projections(state, player_f)
+
+    # (P, P, B)
+    ship_counts = ship_counts_for_buckets(ships[:, None], ships[None, :], incoming_me[None, :], incoming_enemy[None, :])
+
+    from .geometry import precompute_comet_trajectories
+    is_comet, trajectories, valid_time = precompute_comet_trajectories(
+        state.comets.active, state.comets.planet_ids, state.comets.path_index,
+        state.comets.paths, state.comets.path_lengths, pids
+    )
+    tgt_orbiting = is_orbiting_planet(x, y, radius)
+
+    def _full_intercept(sx, sy, sr, sc_row):
+        # sx, sy, sr are scalars. sc_row is (P, B).
+        # We want to check all targets (P,) with their buckets (B,).
+        # Returns (P, B) tensors.
+        return estimate_intercept_angles(
+            sx, sy, sr, x, y, radius, tgt_orbiting, is_comet,
+            trajectories, valid_time, sc_row,
+            state.angular_velocity, state.ship_speed,
+            n_iter=intercept_iterations, sun_margin=sun_path_margin,
+        )
+
+    angle, aim_x, aim_y, sun_blocks = jax.vmap(_full_intercept)(x, y, radius, ship_counts)
+
+    if enable_planet_block:
+        planet_blocks = path_blocked_by_planets(x[:, None], y[:, None], x[None, :], y[None, :], x, y, radius, active, margin=path_planet_margin)
+        planet_blocks = planet_blocks[:, :, None]
+    else:
+        planet_blocks = jnp.zeros((planets.shape[0], planets.shape[0], 1), dtype=jnp.bool_)
+
+    pair_valid = source_valid[:, None] & target_valid[None, :]
+    bucket_valid = bucket_validity_mask(ship_counts, ships)
     full_valid = pair_valid[..., None] & bucket_valid & (~sun_blocks) & (~planet_blocks)
-
-    from_ids = planets[:, 0]
 
     return {
         "source_valid": source_valid,
         "target_valid": target_valid,
-        "angle": angle,
-        "aim_x": aim_x,
-        "aim_y": aim_y,
+        "pair_valid": pair_valid,
+        "bucket_valid": bucket_valid,
         "sun_blocks": sun_blocks,
         "planet_blocks": planet_blocks,
-        "self_target": self_target,
-        "target_valid_pair": target_valid[None, :],
-        "ship_counts": ship_counts,
-        "bucket_valid": bucket_valid,
-        "pair_valid": pair_valid,
         "full_valid": full_valid,
-        "from_ids": from_ids,
+        "from_ids": pids,
+        "angle": angle,
+        "ship_counts": ship_counts,
     }
 
+def compose_action_grid(state, player, **kwargs):
+    return compose_full_grid(state, player, **kwargs)
 
-def pack_action_row(
-    from_id: jnp.ndarray,
-    angle: jnp.ndarray,
-    ships: jnp.ndarray,
-    valid: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    row = jnp.stack([
-        from_id.astype(jnp.float32),
-        angle.astype(jnp.float32),
-        jnp.floor(ships).astype(jnp.float32),
-    ])
+def pack_action_row(from_id, angle, ships, valid):
+    row = jnp.stack([from_id.astype(jnp.float32), angle.astype(jnp.float32), jnp.floor(ships).astype(jnp.float32)], axis=-1)
     valid_f = valid.astype(jnp.float32)
-    return row * valid_f, valid_f
+    return row * valid_f[..., None], valid_f
+
+def launch_angle(src_x, src_y, tgt_x, tgt_y):
+    return jnp.arctan2(tgt_y - src_y, tgt_x - src_x)
+
+def path_crosses_sun(src_x, src_y, tgt_x, tgt_y, margin=SUN_PATH_MARGIN):
+    from .geometry import sun_hit
+    return sun_hit(src_x, src_y, tgt_x, tgt_y, margin=margin)

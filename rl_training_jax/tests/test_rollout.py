@@ -20,7 +20,8 @@ from orbit_wars import (
     MAX_MOVES_PER_PLAYER,
     MAX_PLANETS,
     PLANET_FEATURE_DIM,
-    compose_action_grid,
+    compose_target_grid,
+    compose_bucket_grid,
     encode_observation,
     reset,
     step,
@@ -61,14 +62,17 @@ def test_sample_actions_respects_mask():
     players = jnp.zeros((len(seeds),), dtype=jnp.int32)
     features = _batched_features(batched, players)
     out = model.apply(params, **features)
-    grid = jax.vmap(compose_action_grid, in_axes=(0, 0))(batched, players)
+    
+    phase1 = jax.vmap(compose_target_grid, in_axes=(0, 0, 0, 0))(
+        batched, players, features["incoming_me"], features["incoming_enemy"]
+    )
 
-    sampled = sample_actions(rng, out.target_logits, out.bucket_logits, grid)
+    sampled = sample_actions(rng, out.target_logits, out.bucket_logits, batched, phase1)
     target_idx = np.asarray(sampled["target_idx"])
     bucket_idx = np.asarray(sampled["bucket_idx"])
     source_valid = np.asarray(sampled["source_valid"])
-    bucket_valid = np.asarray(grid["bucket_valid"])
-    pair_valid = np.asarray(grid["pair_valid"])
+    target_mask = np.asarray(phase1["target_mask"])
+    bucket_valid = np.asarray(sampled["chosen_bucket_valid"])
 
     b, p = target_idx.shape
     for bi in range(b):
@@ -77,8 +81,8 @@ def test_sample_actions_respects_mask():
                 continue
             t = target_idx[bi, si]
             k = bucket_idx[bi, si]
-            assert pair_valid[bi, si, t], f"target {t} invalid for source {si} env {bi}"
-            assert bucket_valid[bi, si, t, k], (
+            assert target_mask[bi, si, t], f"target {t} invalid for source {si} env {bi}"
+            assert bucket_valid[bi, si, k], (
                 f"bucket {k} invalid for (src={si}, tgt={t}) env={bi}"
             )
 
@@ -91,11 +95,15 @@ def test_pack_padded_actions_truncates_to_max_moves():
     players = jnp.zeros((len(seeds),), dtype=jnp.int32)
     features = _batched_features(batched, players)
     out = model.apply(params, **features)
-    grid = jax.vmap(compose_action_grid, in_axes=(0, 0))(batched, players)
-    sampled = sample_actions(rng, out.target_logits, out.bucket_logits, grid)
+    
+    phase1 = jax.vmap(compose_target_grid, in_axes=(0, 0, 0, 0))(
+        batched, players, features["incoming_me"], features["incoming_enemy"]
+    )
+    sampled = sample_actions(rng, out.target_logits, out.bucket_logits, batched, phase1)
 
     actions, mask, executed_mask = pack_padded_actions(
-        sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
+        sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"],
+        phase1["from_ids"], sampled["angle"], sampled["ship_counts"]
     )
     assert actions.shape == (2, MAX_MOVES_PER_PLAYER, 3)
     assert mask.shape == (2, MAX_MOVES_PER_PLAYER)
@@ -146,8 +154,11 @@ def test_log_prob_finite_and_zero_when_no_valid_source():
     players = jnp.zeros((1,), dtype=jnp.int32)
     features = _batched_features(batched, players)
     out = model.apply(params, **features)
-    grid = jax.vmap(compose_action_grid, in_axes=(0, 0))(batched, players)
-    sampled = sample_actions(rng, out.target_logits, out.bucket_logits, grid)
+    
+    phase1 = jax.vmap(compose_target_grid, in_axes=(0, 0, 0, 0))(
+        batched, players, features["incoming_me"], features["incoming_enemy"]
+    )
+    sampled = sample_actions(rng, out.target_logits, out.bucket_logits, batched, phase1)
 
     lp = np.asarray(sampled["log_prob"])
     sv = np.asarray(sampled["source_valid"])

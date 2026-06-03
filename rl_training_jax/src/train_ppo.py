@@ -23,7 +23,8 @@ from orbit_wars import (
     MAX_PLANETS,
     PLANET_FEATURE_DIM,
     OrbitWarsState,
-    compose_action_grid,
+    compose_target_grid,
+    compose_bucket_grid,
     encode_observation,
     reset,
 )
@@ -184,13 +185,15 @@ def batched_heuristic_actions(states: OrbitWarsState, players: np.ndarray, agent
 # ---------------------------------------------------------------------------
 
 
-def sample_both_players_factory(model: PlanetPolicy, grid_fn):
+from orbit_wars.decode import compose_target_grid
+from orbit_wars.rollout import pack_padded_actions, sample_actions
+
+def sample_both_players_factory(model: PlanetPolicy, grid_params: dict):
     """Sample policy actions for both seats. Uses params for learner, opp_params for opponent."""
 
     @jax.jit
     def sample(states: OrbitWarsState, params, opp_params, rng, learner_players):
-        rng, k0, k1 = jax.random.split(rng, 3)
-        
+        # 1. Features
         feats0 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(0))
         feats1 = jax.vmap(encode_observation, in_axes=(0, None))(states, jnp.int32(1))
         
@@ -206,45 +209,61 @@ def sample_both_players_factory(model: PlanetPolicy, grid_fn):
         feats_learner = jax.tree_util.tree_map(lambda f0, f1: _gather_feats(f0, f1, is_learner_p0), feats0, feats1)
         feats_opp = jax.tree_util.tree_map(lambda f0, f1: _gather_feats(f0, f1, is_opp_p0), feats0, feats1)
 
+        # 2. Policy Forward
         out_learner = model.apply(params, **feats_learner)
         out_opp = model.apply(opp_params, **feats_opp)
 
         out0 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_learner_p0), out_learner, out_opp)
         out1 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_opp_p0), out_learner, out_opp)
 
-        grid0 = jax.vmap(grid_fn, in_axes=(0, None, 0, 0))(
+        # 3. Phase 1: Target Grids (O(P^2))
+        phase1_0 = jax.vmap(functools.partial(compose_target_grid, **grid_params), in_axes=(0, None, 0, 0))(
             states, jnp.int32(0), feats0["incoming_me"], feats0["incoming_enemy"]
         )
-        s0 = sample_actions(k0, out0.target_logits, out0.bucket_logits, grid0)
-        a0, m0, em0 = pack_padded_actions(s0["target_idx"], s0["bucket_idx"], s0["source_valid"], grid0)
-
-        grid1 = jax.vmap(grid_fn, in_axes=(0, None, 0, 0))(
+        phase1_1 = jax.vmap(functools.partial(compose_target_grid, **grid_params), in_axes=(0, None, 0, 0))(
             states, jnp.int32(1), feats1["incoming_me"], feats1["incoming_enemy"]
         )
-        s1 = sample_actions(k1, out1.target_logits, out1.bucket_logits, grid1)
-        a1, m1, em1 = pack_padded_actions(s1["target_idx"], s1["bucket_idx"], s1["source_valid"], grid1)
+
+        # 4. Phase 2: Sample Targets & Bucket Grids (O(P*B))
+        rng, k0, k1 = jax.random.split(rng, 3)
+        s0 = sample_actions(k0, out0.target_logits, out0.bucket_logits, states, phase1_0, **grid_params)
+        s1 = sample_actions(k1, out1.target_logits, out1.bucket_logits, states, phase1_1, **grid_params)
+
+        # 5. Phase 3: Pack
+        a0, m0, em0 = pack_padded_actions(
+            s0["target_idx"], s0["bucket_idx"], s0["source_valid"],
+            phase1_0["from_ids"], s0["angle"], s0["ship_counts"]
+        )
+        a1, m1, em1 = pack_padded_actions(
+            s1["target_idx"], s1["bucket_idx"], s1["source_valid"],
+            phase1_1["from_ids"], s1["angle"], s1["ship_counts"]
+        )
         
-        return (a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, rng)
+        return (a0, m0, a1, m1, s0, s1, out0, out1, phase1_0, phase1_1, feats0, feats1, em0, em1, rng)
 
     return sample
 
 
-def sample_learner_factory(model: PlanetPolicy, grid_fn):
-    """Sample policy actions for the learner seat only (player varies per env)."""
+def sample_learner_factory(model: PlanetPolicy, grid_params: dict):
+    """Sample policy actions for the learner seat only."""
 
     @jax.jit
     def sample(states: OrbitWarsState, params, rng, learner_players):
         rng, k0 = jax.random.split(rng)
         feats = jax.vmap(encode_observation, in_axes=(0, 0))(states, learner_players)
         out = model.apply(params, **feats)
-        grid = jax.vmap(grid_fn, in_axes=(0, 0, 0, 0))(
+        
+        phase1 = jax.vmap(functools.partial(compose_target_grid, **grid_params), in_axes=(0, 0, 0, 0))(
             states, learner_players, feats["incoming_me"], feats["incoming_enemy"]
         )
-        sampled = sample_actions(k0, out.target_logits, out.bucket_logits, grid)
+        
+        sampled = sample_actions(k0, out.target_logits, out.bucket_logits, states, phase1, **grid_params)
+        
         actions, mask, executed_mask = pack_padded_actions(
-            sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
+            sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"],
+            phase1["from_ids"], sampled["angle"], sampled["ship_counts"]
         )
-        return actions, mask, executed_mask, sampled, out, grid, feats, rng
+        return actions, mask, executed_mask, sampled, out, phase1, feats, rng
 
     return sample
 
@@ -264,8 +283,8 @@ def learner_record_from_samples(
     s1,
     out0,
     out1,
-    grid0,
-    grid1,
+    phase1_0,
+    phase1_1,
     feats0,
     feats1,
     em0,
@@ -280,25 +299,11 @@ def learner_record_from_samples(
     bucket_idx = _gather_by_player(s0["bucket_idx"], s1["bucket_idx"], learner_players)
     log_prob = _gather_by_player(s0["log_prob"], s1["log_prob"], learner_players)
     executed_mask = _gather_by_player(em0, em1, learner_players)
-    target_has_bucket = _gather_by_player(
-        jnp.any(grid0["full_valid"], axis=-1),
-        jnp.any(grid1["full_valid"], axis=-1),
-        learner_players,
-    )
     
-    # Pre-gather the bucket validity mask for the *chosen* targets
-    # This reduces memory from (B, P, P, B) -> (B, P, B).
-    from .orbit_wars.decode import BUCKET_COUNT
-    def _gather_chosen_buckets(grid, sampled):
-        t_idx = sampled["target_idx"] # (B, P)
-        f_val = grid["full_valid"]     # (B, P, P, B)
-        return jnp.take_along_axis(
-            f_val, t_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
-        ).squeeze(2)
-    
-    cbv0 = _gather_chosen_buckets(grid0, s0)
-    cbv1 = _gather_chosen_buckets(grid1, s1)
-    chosen_bucket_valid = _gather_by_player(cbv0, cbv1, learner_players)
+    # target_mask (P, P) is in Phase 1
+    target_has_bucket = _gather_by_player(phase1_0["target_mask"], phase1_1["target_mask"], learner_players)
+    # chosen_bucket_valid (P, B) is in sampled results
+    chosen_bucket_valid = _gather_by_player(s0["chosen_bucket_valid"], s1["chosen_bucket_valid"], learner_players)
 
     reward = jnp.where(
         new_states.done & (learner_players == 0),
@@ -339,17 +344,13 @@ def learner_record_from_single(
     learner_players: jnp.ndarray,
     sampled,
     out,
-    grid,
+    phase1,
     feats,
     executed_mask,
     new_states: OrbitWarsState,
 ) -> dict:
-    target_has_bucket = jnp.any(grid["full_valid"], axis=-1)
-    from .orbit_wars.decode import BUCKET_COUNT
-    t_idx = sampled["target_idx"]  # (B, P)
-    chosen_bucket_valid = jnp.take_along_axis(
-        grid["full_valid"], t_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
-    ).squeeze(2)
+    target_has_bucket = phase1["target_mask"]
+    chosen_bucket_valid = sampled["chosen_bucket_valid"]
 
     batch = jnp.arange(new_states.rewards.shape[0])
     lp = learner_players.astype(jnp.int32)
@@ -376,19 +377,19 @@ def learner_record_from_single(
     }
 
 
-def rollout_step_selfplay_factory(model: PlanetPolicy, grid_fn):
-    sample = sample_both_players_factory(model, grid_fn)
+def rollout_step_selfplay_factory(model: PlanetPolicy, grid_params: dict):
+    sample = sample_both_players_factory(model, grid_params)
     step_jit = __import__("orbit_wars.step", fromlist=["step_jit"]).step_jit
 
     @jax.jit
     def step_one(states: OrbitWarsState, params, opp_params, rng, learner_players, reset_pool):
         rng, k_sample, k_pool, k_lp = jax.random.split(rng, 4)
-        a0, m0, a1, m1, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, k_sample = sample(
+        a0, m0, a1, m1, s0, s1, out0, out1, p1_0, p1_1, feats0, feats1, em0, em1, rng = sample(
             states, params, opp_params, k_sample, learner_players
         )
         new_states = jax.vmap(step_jit)(states, a0, a1, m0, m1)
         record = learner_record_from_samples(
-            learner_players, s0, s1, out0, out1, grid0, grid1, feats0, feats1, em0, em1, new_states,
+            learner_players, s0, s1, out0, out1, p1_0, p1_1, feats0, feats1, em0, em1, new_states,
         )
         
         dones = new_states.done
@@ -414,8 +415,8 @@ def rollout_step_selfplay_factory(model: PlanetPolicy, grid_fn):
     return step_one
 
 
-def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
-    sample = sample_learner_factory(model, grid_fn)
+def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_params: dict):
+    sample = sample_learner_factory(model, grid_params)
     step_jit = __import__("orbit_wars.step", fromlist=["step_jit"]).step_jit
 
     def step_one(
@@ -426,7 +427,7 @@ def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
         opponent_players_np: np.ndarray,
         heuristic_agent,
     ):
-        actions, mask, executed_mask, sampled, out, grid, feats, rng = sample(states, params, rng, learner_players)
+        actions, mask, executed_mask, sampled, out, phase1, feats, rng = sample(states, params, rng, learner_players)
         ha0, hm0, ha1, hm1 = batched_heuristic_actions(states, opponent_players_np, heuristic_agent)
 
         is_learner_p0 = (learner_players == 0)
@@ -437,7 +438,7 @@ def rollout_step_vs_heuristic_factory(model: PlanetPolicy, grid_fn):
 
         new_states = jax.vmap(step_jit)(states, final_a0, final_a1, final_m0, final_m1)
         record = learner_record_from_single(
-            learner_players, sampled, out, grid, feats, executed_mask, new_states,
+            learner_players, sampled, out, phase1, feats, executed_mask, new_states,
         )
         return new_states, record, rng
 
@@ -588,15 +589,14 @@ def train(cfg: TrainConfig) -> None:
     optimizer, pi_sched, vf_sched = make_optimizer(cfg, params)
     opt_state = optimizer.init(params)
 
-    grid_fn = functools.partial(
-        compose_action_grid,
+    grid_params = dict(
         sun_path_margin=1.5,
         path_planet_margin=1.0,
         intercept_iterations=5,
     )
 
-    rollout_selfplay = rollout_step_selfplay_factory(model, grid_fn)
-    rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model, grid_fn)
+    rollout_selfplay = rollout_step_selfplay_factory(model, grid_params)
+    rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model, grid_params)
     policy_update = make_policy_update_step(model, optimizer, cfg)
     value_update = make_value_update_step(model, optimizer, cfg)
 

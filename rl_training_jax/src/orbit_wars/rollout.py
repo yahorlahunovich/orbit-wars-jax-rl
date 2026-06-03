@@ -4,41 +4,29 @@ Wiring:
 
     state, params -> features (Phase 1)
                   -> policy out (Phase 2)
-                  -> decode grid (Phase 3)
-                  -> apply masks, sample target & bucket  (HERE)
-                  -> pack (M, 3) action tensor + mask     (HERE)
+                  -> decode target grid (Phase 3a)
+                  -> sample target (HERE)
+                  -> decode bucket grid for chosen targets (Phase 3b)
+                  -> sample bucket (HERE)
+                  -> pack (M, 3) action tensor + mask (HERE)
 
-Sampling is two-stage:
-
-1. For every owned source planet, sample a target slot from the masked
-   target logits (categorical with -inf on invalid targets).
-2. Conditional on the chosen target, sample a bucket from masked bucket
-   logits.
-
-If a source planet has *no* valid (target, bucket) combination, its move is
-masked out at the action-packing step.
-
-We also compute the joint log-probability and per-row entropy needed by PPO.
+This two-stage decoding avoids the O(P*P*B) bottleneck.
 """
 
 from __future__ import annotations
 
+import functools
 import jax
 import jax.numpy as jnp
 
-from .constants import MAX_MOVES_PER_PLAYER, MAX_PLANETS
-from .decode import BUCKET_COUNT, compose_action_grid
+from .constants import MAX_MOVES_PER_PLAYER, MAX_PLANETS, INTERCEPT_ITERATIONS, SUN_PATH_MARGIN
+from .decode import BUCKET_COUNT, compose_target_grid, compose_bucket_grid, pack_action_row
 
 _NEG_INF = jnp.float32(-1e9)
 
 
 def _masked_log_softmax(logits: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    """log_softmax with -inf for masked entries.
-
-    If ALL entries are masked, we return a safe uniform log-prob so downstream
-    sampling doesn't NaN; the caller still knows the source is invalid via the
-    source-level mask.
-    """
+    """log_softmax with -inf for masked entries."""
     any_valid = jnp.any(mask, axis=-1, keepdims=True)
     safe_logits = jnp.where(mask, logits, _NEG_INF)
     # Replace fully-masked rows with zero logits to avoid -inf log_softmax NaN.
@@ -55,38 +43,22 @@ def _entropy_from_log_probs(log_probs: jnp.ndarray, mask: jnp.ndarray) -> jnp.nd
 def sample_actions(
     rng: jax.Array,
     target_logits: jnp.ndarray,    # (B, P, P)
-    bucket_logits: jnp.ndarray,    # (B, P, BUCKETS)
-    action_grid: dict,             # output of compose_action_grid per env (vmapped: leading B)
+    bucket_logits: jnp.ndarray,    # (B, P, P, BUCKETS)
+    state: OrbitWarsState,         # (B,)
+    phase1: dict,                  # vmapped output of compose_target_grid
     deterministic: bool = False,
+    intercept_iterations: int = INTERCEPT_ITERATIONS,
+    sun_path_margin: float = SUN_PATH_MARGIN,
 ) -> dict[str, jnp.ndarray]:
-    """Sample (target, bucket) per source planet with full masking.
+    """Sample (target, bucket) per source planet with split-phase grid."""
+    target_mask = phase1["target_mask"]              # (B, P, P)
+    source_valid_any = phase1["source_valid_any"]    # (B, P)
 
-    Inputs are batched (`B` = num envs). `action_grid` should be the vmapped
-    output of `compose_action_grid` (i.e. each value has a leading `B` axis).
+    # 1. Target distribution: log_softmax with mask.
+    tgt_log_probs = _masked_log_softmax(target_logits, target_mask)
+    entropy_target = _entropy_from_log_probs(tgt_log_probs, target_mask)
 
-    Returns dict with:
-        target_idx       (B, P) int32         chosen target slot per source
-        bucket_idx       (B, P) int32         chosen bucket per source
-        log_prob         (B, P) float32       joint log-prob of (target, bucket)
-        entropy_target   (B, P) float32       entropy of target distribution
-        entropy_bucket   (B, P) float32       entropy of bucket dist (under chosen target)
-        source_valid     (B, P) bool          source planet is owned AND has >=1 valid action
-        target_valid_any (B, P) bool          at least one valid target for this source
-    """
-    pair_valid = action_grid["pair_valid"]          # (B, P, P)
-    full_valid = action_grid["full_valid"]           # (B, P, P, BUCKETS)
-    source_owned = action_grid["source_valid"]       # (B, P)
-
-    # A target is choosable if any bucket is legal for that (source, target).
-    target_has_bucket = jnp.any(full_valid, axis=-1)     # (B, P, P)
-    target_valid_any = jnp.any(target_has_bucket, axis=-1)              # (B, P)
-    source_valid = source_owned & target_valid_any                      # (B, P)
-
-    # Target distribution: log_softmax with mask.
-    tgt_log_probs = _masked_log_softmax(target_logits, target_has_bucket)
-    entropy_target = _entropy_from_log_probs(tgt_log_probs, target_has_bucket)
-
-    # Sample target. We split rng across (B, P) by folding indices.
+    # Sample target.
     b, p, _ = target_logits.shape
     rng, k_tgt = jax.random.split(rng)
     tgt_keys = jax.random.split(k_tgt, b * p).reshape(b, p, 2)
@@ -97,50 +69,49 @@ def sample_actions(
         return jax.random.categorical(key, lp_row, axis=-1)
 
     target_idx = jax.vmap(jax.vmap(_sample_target))(tgt_log_probs, tgt_keys).astype(jnp.int32)
-    # Force a safe value when source has no valid action (we'll mask the row
-    # out at packing time anyway).
-    target_idx = jnp.where(source_valid, target_idx, jnp.int32(0))
+    # Mask out invalid sources
+    target_idx = jnp.where(source_valid_any, target_idx, jnp.int32(0))
 
     tgt_lp = jnp.take_along_axis(tgt_log_probs, target_idx[..., None], axis=-1).squeeze(-1)
-    tgt_lp = jnp.where(source_valid, tgt_lp, jnp.float32(0.0))
+    tgt_lp = jnp.where(source_valid_any, tgt_lp, jnp.float32(0.0))
 
-    # Bucket distribution conditional on the chosen target (Point 3).
-    # Index into the (B, P, P, BUCKETS) bucket_logits using target_idx.
-    b_idx = jnp.arange(b)[:, None]
-    p_idx = jnp.arange(p)[None, :]
-    chosen_bucket_logits = bucket_logits[b_idx, p_idx, target_idx] # (B, P, BUCKETS)
+    # 2. Phase 2: Compute buckets for CHOSEN targets only (O(P*B) instead of O(P*P*B))
+    from .decode import compose_bucket_grid
+    bucket_grid = jax.vmap(functools.partial(
+        compose_bucket_grid, 
+        intercept_iterations=intercept_iterations,
+        sun_path_margin=sun_path_margin,
+    ))(state, target_idx, phase1)
+    
+    chosen_bucket_valid = bucket_grid["bucket_valid"] # (B, P, BUCKETS)
+    
+    # Gather bucket logits for chosen target: (B, P, BUCKETS)
+    bi = jnp.arange(b)[:, None]
+    si = jnp.arange(p)[None, :]
+    chosen_bucket_logits = bucket_logits[bi, si, target_idx]
 
-    # Gather full_valid[b, s, target_idx[b, s], :] -> (B, P, BUCKETS)
-    chosen_bucket_valid = jnp.take_along_axis(
-        full_valid, target_idx[..., None, None].repeat(BUCKET_COUNT, axis=-1), axis=2
-    ).squeeze(2)                                                # (B, P, BUCKETS)
-    bucket_lp_row = _masked_log_softmax(chosen_bucket_logits, chosen_bucket_valid)
-    entropy_bucket = _entropy_from_log_probs(bucket_lp_row, chosen_bucket_valid)
+    bkt_log_probs = _masked_log_softmax(chosen_bucket_logits, chosen_bucket_valid)
+    entropy_bucket = _entropy_from_log_probs(bkt_log_probs, chosen_bucket_valid)
 
+    # 3. Sample bucket.
     rng, k_bkt = jax.random.split(rng)
     bkt_keys = jax.random.split(k_bkt, b * p).reshape(b, p, 2)
+    bucket_idx = jax.vmap(jax.vmap(_sample_target))(bkt_log_probs, bkt_keys).astype(jnp.int32)
+    bucket_idx = jnp.where(source_valid_any, bucket_idx, jnp.int32(0))
 
-    def _sample_bucket(lp_row, key):
-        if deterministic:
-            return jnp.argmax(lp_row, axis=-1)
-        return jax.random.categorical(key, lp_row, axis=-1)
-
-    bucket_idx = jax.vmap(jax.vmap(_sample_bucket))(bucket_lp_row, bkt_keys).astype(jnp.int32)
-    bucket_idx = jnp.where(source_valid, bucket_idx, jnp.int32(0))
-
-    bkt_lp = jnp.take_along_axis(bucket_lp_row, bucket_idx[..., None], axis=-1).squeeze(-1)
-    bkt_lp = jnp.where(source_valid, bkt_lp, jnp.float32(0.0))
-
-    log_prob = tgt_lp + bkt_lp
+    bkt_lp = jnp.take_along_axis(bkt_log_probs, bucket_idx[..., None], axis=-1).squeeze(-1)
+    bkt_lp = jnp.where(source_valid_any, bkt_lp, jnp.float32(0.0))
 
     return {
         "target_idx": target_idx,
         "bucket_idx": bucket_idx,
-        "log_prob": log_prob,
+        "log_prob": tgt_lp + bkt_lp,
         "entropy_target": entropy_target,
         "entropy_bucket": entropy_bucket,
-        "source_valid": source_valid,
-        "target_valid_any": target_valid_any,
+        "source_valid": source_valid_any,
+        "chosen_bucket_valid": chosen_bucket_valid,
+        "angle": bucket_grid["angle"],
+        "ship_counts": bucket_grid["ship_counts"],
     }
 
 
@@ -148,52 +119,37 @@ def pack_padded_actions(
     target_idx: jnp.ndarray,        # (B, P)
     bucket_idx: jnp.ndarray,        # (B, P)
     source_valid: jnp.ndarray,      # (B, P)
-    action_grid: dict,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Pack per-source decisions into `(B, MAX_MOVES_PER_PLAYER, 3)` action tensors.
-
-    Source planets without a valid action contribute mask=0 (zero row).
-    Because MAX_PLANETS >= MAX_MOVES_PER_PLAYER could be violated (96 > 48),
-    we *sort* sources by `source_valid` so all valid sources land in the
-    first MAX_MOVES_PER_PLAYER slots, then truncate.
-    """
+    from_ids: jnp.ndarray,          # (B, P)
+    angle: jnp.ndarray,             # (B, P, B)  -- GATHERED for chosen target
+    ship_counts: jnp.ndarray,       # (B, P, B)  -- GATHERED for chosen target
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Packs the chosen moves into a (B, 48, 3) action tensor."""
     b, p = target_idx.shape
-    from_ids = action_grid["from_ids"]                          # (B, P)
-    angle_grid = action_grid["angle"]                           # (B, P, P, BUCKETS)
-    ship_counts = action_grid["ship_counts"]                    # (B, P, P, BUCKETS)
-
-    # Gather chosen angle/ship_count per source.
-    s_range = jnp.arange(p, dtype=jnp.int32)
-    b_range = jnp.arange(b, dtype=jnp.int32)
-    bi, si = jnp.meshgrid(b_range, s_range, indexing="ij")
-    angle = angle_grid[bi, si, target_idx, bucket_idx]          # (B, P)
-    ships = ship_counts[bi, si, target_idx, bucket_idx]         # (B, P)
-
-    # Build the per-source row.
-    rows = jnp.stack([from_ids, angle, ships], axis=-1)         # (B, P, 3)
-
+    
+    # Gather chosen angle and ships
+    bi = jnp.arange(b)[:, None]
+    si = jnp.arange(p)[None, :]
+    chosen_angle = angle[bi, si, bucket_idx]
+    chosen_ships = ship_counts[bi, si, bucket_idx]
+    
     # Identify NOOP moves (target == source)
-    is_noop = (target_idx == s_range[None, :])                  # (B, P)
-
-    # Mask is true only for valid sources that are NOT noops.
-    # We zero out the action for NOOPs so no ships are launched.
+    s_range = jnp.arange(p)
+    is_noop = (target_idx == s_range[None, :])
     env_mask = source_valid & (~is_noop)
-    mask = env_mask.astype(jnp.float32)                         # (B, P)
-    rows = rows * mask[..., None]
 
-    # Compact sources so all valid ones are first. We sort by NEGATIVE mask
-    # (valid sources have key=-1 -> sort first), then truncate.
-    sort_key = (-mask).astype(jnp.float32)
-    sort_idx = jnp.argsort(sort_key, axis=-1)                   # (B, P)
+    rows, mask_vals = jax.vmap(pack_action_row)(from_ids, chosen_angle, chosen_ships, env_mask)
+
+    # Compact sources so all valid ones are first.
+    sort_key = (-mask_vals).astype(jnp.float32)
+    sort_idx = jnp.argsort(sort_key, axis=-1)
     rows_sorted = jnp.take_along_axis(rows, sort_idx[..., None].repeat(3, axis=-1), axis=1)
-    mask_sorted = jnp.take_along_axis(mask, sort_idx, axis=-1)
+    mask_sorted = jnp.take_along_axis(mask_vals, sort_idx, axis=-1)
 
     actions = rows_sorted[:, :MAX_MOVES_PER_PLAYER, :]
     action_mask = mask_sorted[:, :MAX_MOVES_PER_PLAYER]
 
-    # Truncation fix (Point 5): identify which sources actually "made the cut".
-    # PPO should only learn from actions that were not truncated.
-    rank = jnp.argsort(sort_idx, axis=-1)                       # (B, P) — rank of each source in sorted list
+    # executed_mask for PPO.
+    rank = jnp.argsort(sort_idx, axis=-1)
     executed_mask = source_valid & (rank < MAX_MOVES_PER_PLAYER) & (~is_noop)
 
     return actions, action_mask, executed_mask
@@ -203,35 +159,40 @@ def policy_step(
     rng: jax.Array,
     policy_apply,
     params,
-    states,                          # vmapped (leading B) OrbitWarsState
+    states,                          # vmapped OrbitWarsState
     features: dict,                  # vmapped encoder output
-    player_per_env: jnp.ndarray,     # (B,) int32 — which player this batch sees
+    player_per_env: jnp.ndarray,     # (B,) int32
     deterministic: bool = False,
 ) -> dict:
-    """One full policy step:
-
-    encode (done outside) -> policy forward -> sample masked actions -> pack.
-
-    Returns a dict containing the action tensor + mask (ready for `step_jit`)
-    and the per-row info PPO needs (`log_prob`, `entropy`, `value`,
-    `executed_mask`).
-    """
+    """One full policy step with split-phase grid composition."""
     out = policy_apply(params, **features)
-    grid = jax.vmap(compose_action_grid, in_axes=(0, 0))(states, player_per_env)
+    
+    # Phase 1: Target Grid
+    phase1 = jax.vmap(compose_target_grid, in_axes=(0, 0, 0, 0))(
+        states, player_per_env, features["incoming_me"], features["incoming_enemy"]
+    )
+    
+    # Phase 2: Sample & Bucket Grid
     sampled = sample_actions(
-        rng, out.target_logits, out.bucket_logits, grid, deterministic=deterministic
+        rng, out.target_logits, out.bucket_logits, states, phase1, deterministic=deterministic
     )
+    
+    # Phase 3: Pack
     actions, action_mask, executed_mask = pack_padded_actions(
-        sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"], grid
+        sampled["target_idx"], sampled["bucket_idx"], sampled["source_valid"],
+        phase1["from_ids"], sampled["angle"], sampled["ship_counts"]
     )
+    
     return {
-        "actions": actions,                          # (B, MAX_MOVES, 3)
-        "action_mask": action_mask,                  # (B, MAX_MOVES)
-        "target_idx": sampled["target_idx"],         # (B, P) — for PPO
+        "actions": actions,
+        "action_mask": action_mask,
+        "target_idx": sampled["target_idx"],
         "bucket_idx": sampled["bucket_idx"],
         "log_prob": sampled["log_prob"],
         "entropy_target": sampled["entropy_target"],
         "entropy_bucket": sampled["entropy_bucket"],
-        "executed_mask": executed_mask,              # (B, P) — for PPO (fixes truncation bias)
-        "value": out.value,                          # (B,)
+        "executed_mask": executed_mask,
+        "value": out.value,
+        "target_has_bucket": phase1["target_mask"], # (B, P, P)
+        "chosen_bucket_valid": sampled["chosen_bucket_valid"], # (B, P, B)
     }
