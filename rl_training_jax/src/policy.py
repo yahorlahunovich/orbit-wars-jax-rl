@@ -90,9 +90,6 @@ class PlanetPolicy(nn.Module):
         self.value_head = nn.Sequential(
             [nn.Dense(self.d_model), nn.gelu, nn.Dense(1)]
         )
-        self.noop_bias = self.param(
-            "noop_bias", nn.initializers.constant(self.noop_bias_init), ()
-        )
 
     def __call__(
         self,
@@ -116,10 +113,6 @@ class PlanetPolicy(nn.Module):
         k = self.target_proj_k(planet_h)                     # (B, P, d)
         scale = jnp.float32(1.0 / jnp.sqrt(self.d_model))
         target_logits = jnp.einsum("bsd,btd->bst", q, k) * scale     # (B, P, P)
-
-        # NOOP bias
-        diag_mask = jnp.eye(p, dtype=target_logits.dtype)            # (P, P)
-        target_logits = target_logits + diag_mask[None, :, :] * self.noop_bias
 
         # Bucket head: Factorized representation for fast O(P^2) assembly
         b_src = self.bucket_src(planet_h)                    # (B, P, BUCKETS)
