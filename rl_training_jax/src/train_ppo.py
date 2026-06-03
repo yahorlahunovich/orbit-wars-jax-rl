@@ -52,8 +52,8 @@ class TrainConfig:
 
     # PPO
     total_updates: int = 5000
-    train_pi_iters: int = 80
-    train_v_iters: int = 80
+    train_pi_iters: int = 4
+    train_v_iters: int = 4
     target_kl: float = 0.05
     minibatch_size: int = 256
     gamma: float = 0.99
@@ -99,8 +99,8 @@ def load_config(path: str | Path) -> TrainConfig:
         bucket_count=int(model.get("bucket_count", 8)),
         weight_decay=float(model.get("weight_decay", 1e-4)),
         total_updates=int(ppo.get("total_updates", 5000)),
-        train_pi_iters=int(ppo.get("train_pi_iters", 80)),
-        train_v_iters=int(ppo.get("train_v_iters", 80)),
+        train_pi_iters=int(ppo.get("train_pi_iters", 4)),
+        train_v_iters=int(ppo.get("train_v_iters", 4)),
         target_kl=float(ppo.get("target_kl", 0.05)),
         minibatch_size=int(ppo.get("minibatch_size", 256)),
         gamma=float(ppo.get("gamma", 0.99)),
