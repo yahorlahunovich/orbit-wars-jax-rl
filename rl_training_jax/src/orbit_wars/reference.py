@@ -71,7 +71,7 @@ def make_reference_env(
     episode_steps: int = 500,
     env_root: str | Path | None = None,
 ) -> Any:
-    root = add_env_root(env_root or default_env_root())
+    add_env_root(env_root or default_env_root())
     from kaggle_environments import make
 
     configuration = {"episodeSteps": int(episode_steps), "seed": int(seed), "randomSeed": int(seed)}

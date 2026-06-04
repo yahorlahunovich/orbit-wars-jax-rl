@@ -5,7 +5,6 @@ expensive O(P*P*B) calculations and huge intermediate tensors.
 
 from __future__ import annotations
 
-import functools
 import jax
 import jax.numpy as jnp
 
@@ -14,7 +13,6 @@ from .constants import (
     PATH_PLANET_MARGIN,
     SUN_PATH_MARGIN,
     INTERCEPT_ITERATIONS,
-    BUCKET_COUNT,
 )
 from .geometry import (
     is_orbiting_planet,
@@ -78,12 +76,6 @@ def path_blocked_by_planets(
     tx = target_x[..., None]
     ty = target_y[..., None]
 
-    x_min = jnp.minimum(sx, tx) - obs_r
-    x_max = jnp.maximum(sx, tx) + obs_r
-    y_min = jnp.minimum(sy, ty) - obs_r
-    y_max = jnp.maximum(sy, ty) + obs_r
-    
-    in_box = (ox >= x_min) & (ox <= x_max) & (oy >= y_min) & (oy <= y_max)
     d = point_to_segment_distance(ox, oy, sx, sy, tx, ty)
     
     # Ignore obstacles at the exact start or end point (self)

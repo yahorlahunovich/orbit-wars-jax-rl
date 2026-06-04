@@ -22,12 +22,10 @@ from .constants import (
     BOARD_SIZE,
     CENTER,
     COMET_SPAWN_STEPS,
-    DEFAULT_SHIP_SPEED,
     MAX_COMET_GROUPS,
     MAX_FLEETS,
     MAX_PLANETS,
     ROTATION_RADIUS_LIMIT,
-    SUN_RADIUS,
 )
 from .geometry import fleet_speed
 from .state import OrbitWarsState

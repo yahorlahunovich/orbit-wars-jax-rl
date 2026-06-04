@@ -22,10 +22,9 @@ from orbit_wars import (
     BUCKET_COUNT,
     INTERCEPT_ITERATIONS,
     SUN_PATH_MARGIN,
-    compose_action_grid,
     path_crosses_sun,
 )
-from orbit_wars.decode import path_blocked_by_planets
+from orbit_wars.decode import compose_action_grid, path_blocked_by_planets
 SUN_X, SUN_Y = 50.0, 50.0
 from orbit_wars.geometry import (
     estimate_intercept_angles,

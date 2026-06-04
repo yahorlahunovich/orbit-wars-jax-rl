@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from .comet import spawn_comet_for_state
 from .constants import (
-    BOARD_SIZE,
     CENTER,
     COMET_SPAWN_STEPS,
-    FLEET_COLS,
     MAX_COMET_GROUPS,
     MAX_COMET_PATH_LEN,
     MAX_COMET_PLANETS,
@@ -21,13 +17,11 @@ from .constants import (
     MAX_MOVES_PER_PLAYER,
     MAX_PLANETS,
     NUM_PLAYERS,
-    PLANET_COLS,
     ROTATION_RADIUS_LIMIT,
-    SUN_RADIUS,
 )
 from .convert import pack_comets
-from .geometry import fleet_speed, in_bounds, point_to_segment_distance, sun_hit, swept_pair_hit
-from .state import CometGroups, OrbitWarsState
+from .geometry import fleet_speed, in_bounds, sun_hit, swept_pair_hit
+from .state import OrbitWarsState
 
 # ---------------------------------------------------------------------------
 # Python-side comet bookkeeping (rare: at most ~10 expiries + 5 spawns per game)

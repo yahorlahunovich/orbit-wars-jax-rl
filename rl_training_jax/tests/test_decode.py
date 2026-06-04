@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from orbit_wars import MAX_PLANETS, reset, step
+from orbit_wars.constants import BUCKET_COUNT
 from orbit_wars.decode import (
-    BUCKET_COUNT,
     compose_action_grid,
     compose_full_grid,
     launch_angle,

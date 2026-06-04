@@ -10,8 +10,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from orbit_wars.decode import BUCKET_COUNT
-
 
 # ---------------------------------------------------------------------------
 # GAE
@@ -188,80 +186,6 @@ def joint_loss_fn(
         "clip_fraction": clip_frac,
     }
 
-
-def policy_loss_fn(
-    params,
-    apply_fn,
-    batch: dict,
-    clip_coef: float,
-    ent_coef: float,
-) -> tuple[jnp.ndarray, dict]:
-    """Clipped PPO policy loss + Entropy."""
-    out = apply_fn(
-        params,
-        planet_features=batch["planet_features"],
-        planet_mask=batch["planet_mask"],
-    )
-
-    info = joint_log_prob_and_entropy(
-        target_logits=out.target_logits,
-        bucket_logits=out.bucket_logits,
-        target_has_bucket=batch["target_has_bucket"],
-        chosen_bucket_valid=batch["chosen_bucket_valid"],
-        target_idx=batch["target_idx"],
-        bucket_idx=batch["bucket_idx"],
-        executed_mask=batch["executed_mask"],
-    )
-    new_log_prob = info["log_prob"]
-    entropy = info["entropy_target"] + info["entropy_bucket"]
-
-    old_log_prob = batch["old_log_prob"]
-    adv_env = batch["advantages"]
-    
-    # Per-minibatch advantage normalization
-    adv_mean = jnp.mean(adv_env)
-    adv_std = jnp.std(adv_env)
-    adv_norm = (adv_env - adv_mean) / jnp.maximum(adv_std, 1e-8)
-    
-    # Use the thoroughly cleaned mask that ignores sources with 0 valid actions.
-    valid_mask = info["valid_mask"]
-    mask_f = valid_mask.astype(jnp.float32)
-    mask_count = jnp.maximum(jnp.sum(mask_f), 1.0)
-
-    adv = adv_norm[:, None]
-    ratio = jnp.exp(new_log_prob - old_log_prob)
-    unclipped = ratio * adv
-    clipped = jnp.clip(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv
-    policy_loss = -jnp.sum(jnp.minimum(unclipped, clipped) * mask_f) / mask_count
-
-    entropy_mean = jnp.sum(entropy * mask_f) / mask_count
-    
-    loss = policy_loss - ent_coef * entropy_mean
-
-    log_ratio = new_log_prob - old_log_prob
-    approx_kl = jnp.sum((ratio - 1.0 - log_ratio) * mask_f) / mask_count
-    clip_frac = jnp.sum(((jnp.abs(ratio - 1.0) > clip_coef).astype(jnp.float32)) * mask_f) / mask_count
-
-    return loss, {
-        "policy_loss": policy_loss,
-        "entropy": entropy_mean,
-        "approx_kl": approx_kl,
-        "clip_fraction": clip_frac,
-    }
-
-
-def value_loss_fn(
-    params,
-    apply_fn,
-    batch: dict,
-) -> jnp.ndarray:
-    """Mean Squared Error value loss."""
-    out = apply_fn(
-        params,
-        planet_features=batch["planet_features"],
-        planet_mask=batch["planet_mask"],
-    )
-    return jnp.mean((batch["returns"] - out.value) ** 2)
 
 
 def explained_variance(returns: jnp.ndarray, values: jnp.ndarray) -> jnp.ndarray:

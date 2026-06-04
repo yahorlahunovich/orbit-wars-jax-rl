@@ -4,7 +4,6 @@ Updated with logic from the 1100 ELO heuristic notebook.
 
 from __future__ import annotations
 
-from typing import Any
 import jax
 import jax.numpy as jnp
 
@@ -116,7 +115,6 @@ def precompute_comet_trajectories(
     planet_ids: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     MAX_LEN = comet_paths.shape[2]
-    P = planet_ids.shape[0]
     G = comet_active.shape[0]
     
     flat_active = jnp.repeat(comet_active, 4)

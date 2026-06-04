@@ -7,7 +7,6 @@ import functools
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import flax.serialization
 import jax
@@ -17,14 +16,11 @@ import optax
 import yaml
 
 from orbit_wars import (
-    BUCKET_COUNT,
     MAX_FLEETS,
-    MAX_MOVES_PER_PLAYER,
     MAX_PLANETS,
     PLANET_FEATURE_DIM,
     OrbitWarsState,
     compose_target_grid,
-    compose_bucket_grid,
     encode_observation,
     reset,
 )
@@ -185,9 +181,6 @@ def batched_heuristic_actions(states: OrbitWarsState, players: np.ndarray, agent
 # ---------------------------------------------------------------------------
 
 
-from orbit_wars.decode import compose_target_grid
-from orbit_wars.rollout import pack_padded_actions, sample_actions
-
 def sample_both_players_factory(model: PlanetPolicy, grid_params: dict):
     """Sample policy actions for both seats. Uses params for learner, opp_params for opponent."""
 
@@ -213,8 +206,8 @@ def sample_both_players_factory(model: PlanetPolicy, grid_params: dict):
         out_learner = model.apply(params, **feats_learner)
         out_opp = model.apply(opp_params, **feats_opp)
 
-        out0 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_learner_p0), out_learner, out_opp)
-        out1 = jax.tree_util.tree_map(lambda l, o: _gather_feats(l, o, is_opp_p0), out_learner, out_opp)
+        out0 = jax.tree_util.tree_map(lambda lrnr, o: _gather_feats(lrnr, o, is_learner_p0), out_learner, out_opp)
+        out1 = jax.tree_util.tree_map(lambda lrnr, o: _gather_feats(lrnr, o, is_opp_p0), out_learner, out_opp)
 
         # 3. Phase 1: Target Grids (O(P^2))
         phase1_0 = jax.vmap(functools.partial(compose_target_grid, **grid_params), in_axes=(0, None, 0, 0))(
@@ -618,7 +611,6 @@ def train(cfg: TrainConfig) -> None:
     for update_idx in range(1, cfg.total_updates + 1):
         # ------- Rollout -------
         rollout_records = []
-        t_rollout = time.perf_counter()
         
         for _ in range(cfg.rollout_steps):
             # Always check for comet spawn (Point 4)
@@ -671,7 +663,6 @@ def train(cfg: TrainConfig) -> None:
                 learner_losses += int(losses)
                 learner_draws += int(draws)
 
-        rollout_s = time.perf_counter() - t_rollout
         total_env_steps += cfg.rollout_steps * cfg.num_envs
 
         # ------- bootstrap value for GAE -------
@@ -709,7 +700,6 @@ def train(cfg: TrainConfig) -> None:
         n_rows = flat["advantages"].shape[0]
 
         # ------- PPO update (Spinning Up style) -------
-        t_train = time.perf_counter()
         metrics_accum = {
             "policy_loss": 0.0, "value_loss": 0.0,
             "entropy": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0,
@@ -746,8 +736,6 @@ def train(cfg: TrainConfig) -> None:
         if pi_steps > 0:
             for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
                 metrics_accum[k] /= pi_steps
-
-        train_s = time.perf_counter() - t_train
 
         ev = float(explained_variance(flat["returns"], flat["advantages"] + flat["returns"] - flat["advantages"]))  # ≈ EV(returns, returns) sanity
         # Better: compute new values on (subset of) batch — quick approximation:

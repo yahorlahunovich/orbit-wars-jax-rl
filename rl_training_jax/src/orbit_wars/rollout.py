@@ -19,8 +19,9 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from .constants import MAX_MOVES_PER_PLAYER, MAX_PLANETS, INTERCEPT_ITERATIONS, SUN_PATH_MARGIN
-from .decode import BUCKET_COUNT, compose_target_grid, compose_bucket_grid, pack_action_row
+from .constants import MAX_MOVES_PER_PLAYER, INTERCEPT_ITERATIONS, SUN_PATH_MARGIN
+from .decode import compose_target_grid, pack_action_row
+from .state import OrbitWarsState
 
 _NEG_INF = jnp.float32(-1e9)
 

@@ -14,10 +14,9 @@ from .constants import (
     MAX_COMET_PLANETS,
     MAX_FLEETS,
     MAX_PLANETS,
-    NUM_PLAYERS,
     PLANET_COLS,
 )
-from .state import CometGroups, OrbitWarsState, empty_comet_groups, empty_state
+from .state import CometGroups, OrbitWarsState
 
 
 def _get(obs: Any, key: str, default: Any = None) -> Any:
@@ -104,7 +103,6 @@ def observation_to_state(
     done: bool = False,
     rewards: tuple[float, float] = (0.0, 0.0),
 ) -> OrbitWarsState:
-    base = empty_state()
     planet_pad = np.zeros((MAX_PLANETS, PLANET_COLS), dtype=np.float32)
     fleet_pad = np.zeros((MAX_FLEETS, FLEET_COLS), dtype=np.float32)
 

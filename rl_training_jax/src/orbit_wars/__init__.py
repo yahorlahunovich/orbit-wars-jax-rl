@@ -1,12 +1,10 @@
 
-from .constants import *
+from .constants import *  # noqa: F403
 from .convert import observation_to_state, state_to_observation_dict, states_equal
 from .decode import (
-    BUCKET_COUNT,
     bucket_validity_mask,
     compose_target_grid,
     compose_bucket_grid,
-    compose_action_grid,
     launch_angle,
     pack_action_row,
     path_crosses_sun,
@@ -22,7 +20,6 @@ from .features_jax import (
     encode_observation,
     encode_observation_jit,
 )
-from .geometry import distance_xy, fleet_speed, point_to_segment_distance, swept_pair_hit
 from .reference import reference_reset, reference_step
 from .reset import reset
 from .state import OrbitWarsState

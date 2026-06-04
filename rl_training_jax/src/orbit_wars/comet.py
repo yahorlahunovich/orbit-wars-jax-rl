@@ -13,8 +13,6 @@ from .constants import (
     CENTER,
     COMET_PRODUCTION,
     COMET_RADIUS,
-    MAX_COMET_PLANETS,
-    MAX_PLANETS,
     ROTATION_RADIUS_LIMIT,
     SUN_RADIUS,
 )

@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from .convert import state_to_observation_dict
-from .reference import reference_step
 from .reset import reset
 from .state import OrbitWarsState
 from .step import step
@@ -78,8 +77,6 @@ class VectorOrbitWarsEnv:
 
     def reset_batch(self, seeds: list[int]) -> list[dict[str, Any]]:
         assert len(seeds) == self.num_envs
-        import jax.numpy as jnp
-        from .state import empty_state
 
         states = [reset(s, episode_steps=self.episode_steps) for s in seeds]
         # stack into batched struct — for benchmark use list stepping if stack fails
