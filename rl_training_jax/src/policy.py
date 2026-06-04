@@ -49,16 +49,22 @@ class TransformerBlock(nn.Module):
             num_heads=self.num_heads,
             qkv_features=self.d_model,
             out_features=self.d_model,
-            kernel_init=nn.initializers.xavier_uniform(),
+            kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)),
         )
         x_norm = nn.LayerNorm()(tokens)
         x_attn = attn(x_norm, x_norm, mask=mask)
         tokens = tokens + x_attn
 
         y_norm = nn.LayerNorm()(tokens)
-        y = nn.Dense(self.d_model * self.ff_mult)(y_norm)
+        y = nn.Dense(
+            self.d_model * self.ff_mult,
+            kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)),
+        )(y_norm)
         y = nn.gelu(y)
-        y = nn.Dense(self.d_model)(y)
+        y = nn.Dense(
+            self.d_model,
+            kernel_init=nn.initializers.orthogonal(1.0),
+        )(y)
         tokens = tokens + y
 
         tokens = tokens * kv_padding_mask[:, :, None].astype(tokens.dtype)
@@ -78,17 +84,34 @@ class PlanetPolicy(nn.Module):
     noop_bias_init: float = 1.0
 
     def setup(self) -> None:
-        self.planet_in = nn.Dense(self.d_model)
+        self.planet_in = nn.Dense(
+            self.d_model, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2))
+        )
         self.blocks = [
             TransformerBlock(self.d_model, self.num_heads, self.ff_mult)
             for _ in range(self.num_layers)
         ]
-        self.target_proj_q = nn.Dense(self.d_model)
-        self.target_proj_k = nn.Dense(self.d_model)
-        self.bucket_src = nn.Dense(self.bucket_count)
-        self.bucket_tgt = nn.Dense(self.bucket_count)
+        self.target_proj_q = nn.Dense(
+            self.d_model, kernel_init=nn.initializers.orthogonal(0.01)
+        )
+        self.target_proj_k = nn.Dense(
+            self.d_model, kernel_init=nn.initializers.orthogonal(0.01)
+        )
+        self.bucket_src = nn.Dense(
+            self.bucket_count, kernel_init=nn.initializers.orthogonal(0.01)
+        )
+        self.bucket_tgt = nn.Dense(
+            self.bucket_count, kernel_init=nn.initializers.orthogonal(0.01)
+        )
+        self.noop_bias = self.param(
+            "noop_bias", nn.initializers.constant(self.noop_bias_init), (1,)
+        )
         self.value_head = nn.Sequential(
-            [nn.Dense(self.d_model), nn.gelu, nn.Dense(1)]
+            [
+                nn.Dense(self.d_model, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2))),
+                nn.gelu,
+                nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0)),
+            ]
         )
 
     def __call__(
@@ -114,6 +137,10 @@ class PlanetPolicy(nn.Module):
         k = self.target_proj_k(planet_h)                     # (B, P, d)
         scale = jnp.float32(1.0 / jnp.sqrt(self.d_model))
         target_logits = jnp.einsum("bsd,btd->bst", q, k) * scale     # (B, P, P)
+
+        # Add noop bias to the diagonal (source == target)
+        diag = jnp.eye(p, dtype=target_logits.dtype)         # (P, P)
+        target_logits = target_logits + diag[None, :, :] * self.noop_bias
 
         # Bucket head: Factorized representation for fast O(P^2) assembly
         b_src = self.bucket_src(planet_h)                    # (B, P, BUCKETS)

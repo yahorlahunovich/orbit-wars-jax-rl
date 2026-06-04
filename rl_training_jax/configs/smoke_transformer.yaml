@@ -13,7 +13,7 @@ model:
   d_model: 48
   num_heads: 4
   num_layers: 2
-  bucket_count: 8
+  bucket_count: 3
 
 ppo:
   total_updates: 20
@@ -22,7 +22,7 @@ ppo:
   gamma: 0.9999
   gae_lambda: 0.95
   clip_coef: 0.2
-  ent_coef: 0.01
+  ent_coef: 0.05
   vf_coef: 0.5
   lr_start: 1.0e-3
   lr_end: 1.0e-5

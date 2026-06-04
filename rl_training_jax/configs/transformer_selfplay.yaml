@@ -5,7 +5,7 @@ run_name: jax_ppo_transformer
 save_dir: artifacts
 
 env:
-  num_envs: 32           # 64 OOMs on T4 (16 GB). Bump back up on bigger GPUs.
+  num_envs: 128          # Increased for larger batch size
   episode_steps: 500
   rollout_steps: 32
 
@@ -13,20 +13,21 @@ model:
   d_model: 96
   num_heads: 4
   num_layers: 3
-  bucket_count: 8
+  bucket_count: 3
 
 ppo:
   total_updates: 5000
-  epochs: 3
-  minibatch_size: 256    # peak attention memory ~ B * H * T^2; 256 fits T4
-  gamma: 0.9999
+  epochs: 1              # Set to 1 as per Top 10 solution
+  minibatch_size: 1024   # Increased for stability
+  gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.2
   ent_coef: 0.01
   vf_coef: 0.5
-  lr_start: 1.0e-3
-  lr_end: 1.0e-5
-  max_grad_norm: 0.5
+  lr_start: 3.0e-5       # Strictly enforced
+  lr_end: 1.0e-6
+  max_grad_norm: 1.0
+  lr_total_updates: 5000
 
 log_every: 5
 checkpoint_every: 100

@@ -150,9 +150,9 @@ def pack_padded_actions(
     actions = rows_sorted[:, :MAX_MOVES_PER_PLAYER, :]
     action_mask = mask_sorted[:, :MAX_MOVES_PER_PLAYER]
 
-    # executed_mask for PPO.
+    # executed_mask for PPO. Includes NOOPs so they contribute to entropy and policy gradients.
     rank = jnp.argsort(sort_idx, axis=-1)
-    executed_mask = source_valid & (rank < MAX_MOVES_PER_PLAYER) & (~is_noop)
+    executed_mask = source_valid & (rank < MAX_MOVES_PER_PLAYER)
 
     return actions, action_mask, executed_mask
 

@@ -30,21 +30,17 @@ def ship_counts_for_buckets(
     inc_me: jnp.ndarray,    # (...)
     inc_en: jnp.ndarray,    # (...)
 ) -> jnp.ndarray:
-    """Return an array of ship counts for each of the 8 buckets."""
-    b0 = src_ships * 0.10
-    b1 = src_ships * 0.25
-    b2 = src_ships * 0.33
-    b3 = src_ships * 0.50
-    b4 = src_ships * 1.00
+    """Return an array of ship counts for 3 buckets: 50%, 75%, 100%."""
+    b0 = src_ships * 0.50
+    b1 = src_ships * 0.75
+    b2 = src_ships * 1.00
     
-    needed = jnp.maximum(0.0, tgt_ships + inc_en - inc_me)
-    b5 = needed + 1.0
-    b6 = needed + 5.0
-    b7 = needed + 10.0
-    
-    bs = jnp.broadcast_arrays(b0, b1, b2, b3, b4, b5, b6, b7)
-    counts = jnp.stack(bs, axis=-1)
-    return jnp.clip(jnp.floor(counts), 1.0, jnp.maximum(1.0, src_ships[..., None]))
+    counts = jnp.stack([b0, b1, b2], axis=-1)
+    # Floor at MIN_LAUNCH_SHIPS to prevent 1-ship spamming.
+    # We clip to at least MIN_LAUNCH_SHIPS, but bucket_validity_mask will handle the logic
+    # of ensuring we actually HAVE that many ships to send.
+    from .constants import MIN_LAUNCH_SHIPS
+    return jnp.clip(jnp.floor(counts), float(MIN_LAUNCH_SHIPS), jnp.maximum(float(MIN_LAUNCH_SHIPS), src_ships[..., None]))
 
 
 def bucket_validity_mask(

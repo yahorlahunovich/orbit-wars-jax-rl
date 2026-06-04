@@ -40,7 +40,7 @@ class TrainConfig:
     save_dir: str = "artifacts"
 
     # Env
-    num_envs: int = 32
+    num_envs: int = 128
     episode_steps: int = 500
     rollout_steps: int = 32
 
@@ -48,26 +48,26 @@ class TrainConfig:
     d_model: int = 96
     num_heads: int = 4
     num_layers: int = 3
-    bucket_count: int = 8
+    bucket_count: int = 3
     weight_decay: float = 1e-4
 
     # PPO
     total_updates: int = 5000
-    train_pi_iters: int = 4
-    train_v_iters: int = 4
+    train_pi_iters: int = 1
+    train_v_iters: int = 1
     target_kl: float = 0.05
-    minibatch_size: int = 256
+    minibatch_size: int = 512
     gamma: float = 0.99
-    gae_lambda: float = 0.97
+    gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.02  # Reduced to allow the model to commit to strong moves
+    ent_coef: float = 0.01
     vf_coef: float = 0.5
-    pi_lr: float = 3e-4
-    vf_lr: float = 1e-3
-    lr_end: float = 1e-4
+    pi_lr: float = 3e-5
+    vf_lr: float = 3e-5
+    lr_end: float = 1e-6
     lr_warmup_updates: int = 100
-    lr_total_updates: int = 1000
-    max_grad_norm: float = 0.5
+    lr_total_updates: int = 5000
+    max_grad_norm: float = 1.0
 
     # Opponent
     opponent: str = "selfplay"  # selfplay | heuristic | curriculum
@@ -91,30 +91,30 @@ def load_config(path: str | Path) -> TrainConfig:
         seed=int(data.get("seed", 0)),
         run_name=str(data.get("run_name", "jax_ppo_transformer")),
         save_dir=str(data.get("save_dir", "artifacts")),
-        num_envs=int(env.get("num_envs", 32)),
+        num_envs=int(env.get("num_envs", 128)),
         episode_steps=int(env.get("episode_steps", 500)),
         rollout_steps=int(env.get("rollout_steps", 32)),
         d_model=int(model.get("d_model", 96)),
         num_heads=int(model.get("num_heads", 4)),
         num_layers=int(model.get("num_layers", 3)),
-        bucket_count=int(model.get("bucket_count", 8)),
+        bucket_count=int(model.get("bucket_count", 3)),
         weight_decay=float(model.get("weight_decay", 1e-4)),
         total_updates=int(ppo.get("total_updates", 5000)),
-        train_pi_iters=int(ppo.get("train_pi_iters", 4)),
-        train_v_iters=int(ppo.get("train_v_iters", 4)),
+        train_pi_iters=int(ppo.get("train_pi_iters", 1)),
+        train_v_iters=int(ppo.get("train_v_iters", 1)),
         target_kl=float(ppo.get("target_kl", 0.05)),
-        minibatch_size=int(ppo.get("minibatch_size", 256)),
+        minibatch_size=int(ppo.get("minibatch_size", 1024)),
         gamma=float(ppo.get("gamma", 0.99)),
-        gae_lambda=float(ppo.get("gae_lambda", 0.97)),
+        gae_lambda=float(ppo.get("gae_lambda", 0.95)),
         clip_coef=float(ppo.get("clip_coef", 0.2)),
-        ent_coef=float(ppo.get("ent_coef", 0.02)),
+        ent_coef=float(ppo.get("ent_coef", 0.01)),
         vf_coef=float(ppo.get("vf_coef", 0.5)),
-        pi_lr=float(ppo.get("pi_lr", 3e-4)),
-        vf_lr=float(ppo.get("vf_lr", 1e-3)),
-        lr_end=float(ppo.get("lr_end", 1e-4)),
+        pi_lr=float(ppo.get("pi_lr", ppo.get("lr_start", 3e-5))),
+        vf_lr=float(ppo.get("vf_lr", ppo.get("lr_start", 3e-5))),
+        lr_end=float(ppo.get("lr_end", 1e-6)),
         lr_warmup_updates=int(ppo.get("lr_warmup_updates", 100)),
-        lr_total_updates=int(ppo.get("lr_total_updates", 1000)),
-        max_grad_norm=float(ppo.get("max_grad_norm", 0.5)),
+        lr_total_updates=int(ppo.get("lr_total_updates", 5000)),
+        max_grad_norm=float(ppo.get("max_grad_norm", 1.0)),
         opponent=str(data.get("opponent", "selfplay")),
         heuristic_win_rate=float(opp.get("win_rate", 0.6)),
         heuristic_window_episodes=int(opp.get("window_episodes", 100)),
@@ -491,7 +491,7 @@ def make_optimizer(cfg: TrainConfig, params):
     
     # We estimate total optimizer steps based on the MAX iterations.
     # Note: policy might early stop, but value usually doesn't.
-    steps_per_update = (cfg.train_pi_iters + cfg.train_v_iters) * steps_per_epoch
+    steps_per_update = cfg.train_pi_iters * steps_per_epoch
     
     warmup_steps = cfg.lr_warmup_updates * steps_per_update
     total_steps = cfg.lr_total_updates * steps_per_update
@@ -527,43 +527,17 @@ def make_optimizer(cfg: TrainConfig, params):
     return optimizer, pi_schedule, vf_schedule
 
 
-def make_policy_update_step(model: PlanetPolicy, optimizer, cfg: TrainConfig):
-    from ppo import policy_loss_fn
+def make_update_step(model: PlanetPolicy, optimizer, cfg: TrainConfig):
+    from ppo import joint_loss_fn
     @jax.jit
-    def update(params, opt_state, batch):
+    def update(params, opt_state, batch, ent_coef):
         def loss(p):
-            return policy_loss_fn(p, model.apply, batch, cfg.clip_coef, cfg.ent_coef)
+            return joint_loss_fn(p, model.apply, batch, cfg.clip_coef, ent_coef, cfg.vf_coef)
         (l, metrics), grads = jax.value_and_grad(loss, has_aux=True)(params)
-        
-        # Zero out value_head grads during policy update
-        def zero_vf_grads(path, g):
-            names = [p.key if hasattr(p, 'key') else str(p) for p in path]
-            return jnp.zeros_like(g) if 'value_head' in names else g
-        grads = jax.tree_util.tree_map_with_path(zero_vf_grads, grads)
 
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, l, metrics
-    return update
-
-
-def make_value_update_step(model: PlanetPolicy, optimizer, cfg: TrainConfig):
-    from ppo import value_loss_fn
-    @jax.jit
-    def update(params, opt_state, batch):
-        def loss(p):
-            return value_loss_fn(p, model.apply, batch)
-        l, grads = jax.value_and_grad(loss)(params)
-        
-        # Zero out policy grads during value update
-        def zero_pi_grads(path, g):
-            names = [p.key if hasattr(p, 'key') else str(p) for p in path]
-            return g if 'value_head' in names else jnp.zeros_like(g)
-        grads = jax.tree_util.tree_map_with_path(zero_pi_grads, grads)
-
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, l
     return update
 
 
@@ -597,8 +571,7 @@ def train(cfg: TrainConfig) -> None:
 
     rollout_selfplay = rollout_step_selfplay_factory(model, grid_params)
     rollout_vs_heuristic = rollout_step_vs_heuristic_factory(model, grid_params)
-    policy_update = make_policy_update_step(model, optimizer, cfg)
-    value_update = make_value_update_step(model, optimizer, cfg)
+    train_update = make_update_step(model, optimizer, cfg)
 
     opponent_mode = cfg.opponent.lower()
     if opponent_mode not in ("selfplay", "heuristic", "curriculum"):
@@ -640,7 +613,7 @@ def train(cfg: TrainConfig) -> None:
     
     n_rows_full = cfg.num_envs * cfg.rollout_steps
     steps_per_epoch = (n_rows_full + cfg.minibatch_size - 1) // cfg.minibatch_size
-    steps_per_update = (cfg.train_pi_iters + cfg.train_v_iters) * steps_per_epoch
+    steps_per_update = cfg.train_pi_iters * steps_per_epoch
 
     for update_idx in range(1, cfg.total_updates + 1):
         # ------- Rollout -------
@@ -742,16 +715,25 @@ def train(cfg: TrainConfig) -> None:
             "entropy": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0,
         }
         
-        # 1. Policy Training with Early Stopping
+        # Joint Policy and Value Training with Early Stopping
         pi_steps = 0
+        # Determine ent_coef for this update (Linear Decay)
+        decay_steps = 2000
+        min_ent = 0.002
+        current_ent_coef = float(max(
+            min_ent,
+            cfg.ent_coef - (cfg.ent_coef - min_ent) * (min(update_idx, decay_steps) / decay_steps)
+        ))
+
         for _ in range(cfg.train_pi_iters):
             perm = np.random.permutation(n_rows)
             for start in range(0, n_rows, cfg.minibatch_size):
                 idx = perm[start : start + cfg.minibatch_size]
                 mb = {k: v[idx] for k, v in flat.items()}
-                params, opt_state, _loss, m = policy_update(params, opt_state, mb)
+                params, opt_state, _loss, m = train_update(params, opt_state, mb, current_ent_coef)
                 
                 metrics_accum["policy_loss"] += float(m["policy_loss"])
+                metrics_accum["value_loss"] += float(m["value_loss"])
                 metrics_accum["entropy"] += float(m["entropy"])
                 metrics_accum["approx_kl"] += float(m["approx_kl"])
                 metrics_accum["clip_fraction"] += float(m["clip_fraction"])
@@ -762,22 +744,8 @@ def train(cfg: TrainConfig) -> None:
                 break
         
         if pi_steps > 0:
-            for k in ("policy_loss", "entropy", "approx_kl", "clip_fraction"):
+            for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
                 metrics_accum[k] /= pi_steps
-
-        # 2. Value Function Fitting
-        v_steps = 0
-        for _ in range(cfg.train_v_iters):
-            perm = np.random.permutation(n_rows)
-            for start in range(0, n_rows, cfg.minibatch_size):
-                idx = perm[start : start + cfg.minibatch_size]
-                mb = {k: v[idx] for k, v in flat.items()}
-                params, opt_state, v_loss = value_update(params, opt_state, mb)
-                metrics_accum["value_loss"] += float(v_loss)
-                v_steps += 1
-        
-        if v_steps > 0:
-            metrics_accum["value_loss"] /= v_steps
 
         train_s = time.perf_counter() - t_train
 
