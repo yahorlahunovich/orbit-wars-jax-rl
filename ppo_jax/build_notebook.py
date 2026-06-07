@@ -40,6 +40,7 @@ def main():
         "import os\n"
         "os.makedirs('src/orbit_wars', exist_ok=True)\n"
         "os.makedirs('models/planet_transformer_jax', exist_ok=True)\n"
+        "os.makedirs('env', exist_ok=True)\n"
     ))
     
     cells.append(md_cell("## Environment and Policy Source Code"))
@@ -49,6 +50,14 @@ def main():
     cells.append(writefile_cell("models/__init__.py", ""))
     cells.append(writefile_cell("models/planet_transformer_jax/__init__.py", ""))
     cells.append(writefile_cell("models/planet_transformer_jax/network_jax.py", models_src.read_text()))
+
+    # Write env files
+    env_dir = root_dir.parent / "env"
+    cells.append(writefile_cell("env/__init__.py", ""))
+    for file_path in env_dir.glob("*.py"):
+        if file_path.name != "__init__.py":
+            rel_path = f"env/{file_path.name}"
+            cells.append(writefile_cell(rel_path, file_path.read_text()))
 
     # Write orbit_wars files
     ow_dir = root_dir / "src" / "orbit_wars"
