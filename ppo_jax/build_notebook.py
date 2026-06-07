@@ -36,7 +36,7 @@ def main():
     
     cells.append(md_cell("## Setup Packages and Directories"))
     cells.append(code_cell(
-        "!pip install -q distrax gymnax\n"
+        "!pip install -q distrax gymnax equinox jaxtyping\n"
         "import os\n"
         "os.makedirs('src/orbit_wars', exist_ok=True)\n"
     ))
