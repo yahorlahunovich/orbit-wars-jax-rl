@@ -39,10 +39,17 @@ def main():
         "!pip install -q distrax gymnax equinox jaxtyping\n"
         "import os\n"
         "os.makedirs('src/orbit_wars', exist_ok=True)\n"
+        "os.makedirs('models/planet_transformer_jax', exist_ok=True)\n"
     ))
     
     cells.append(md_cell("## Environment and Policy Source Code"))
     
+    # Write models files
+    models_src = root_dir.parent / "models" / "planet_transformer_jax" / "network_jax.py"
+    cells.append(writefile_cell("models/__init__.py", ""))
+    cells.append(writefile_cell("models/planet_transformer_jax/__init__.py", ""))
+    cells.append(writefile_cell("models/planet_transformer_jax/network_jax.py", models_src.read_text()))
+
     # Write orbit_wars files
     ow_dir = root_dir / "src" / "orbit_wars"
     for file_path in ow_dir.glob("*.py"):
