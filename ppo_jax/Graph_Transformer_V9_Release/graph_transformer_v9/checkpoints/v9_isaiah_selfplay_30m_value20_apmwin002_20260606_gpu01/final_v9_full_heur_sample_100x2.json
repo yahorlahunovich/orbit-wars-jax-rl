@@ -1,0 +1,28 @@
+{
+  "checkpoint": "models/graph_transformer_v9/checkpoints/v9_isaiah_selfplay_30m_value20_apmwin002_20260606_gpu01/final.pkl",
+  "mode": "sample",
+  "games_per_opponent": 100,
+  "eval_type": "v9_jax_env_original_heuristic_code",
+  "note": "Opponent decisions are produced by the original heuristic files; launches are mapped into the V9 50/75/100 target-bin action space for the JAX environment.",
+  "opponents": {
+    "1020": {
+      "games": 100,
+      "wins": 100.0,
+      "win_rate": 1.0,
+      "avg_steps": 156.42,
+      "seconds": 234.17667531967163,
+      "workers": 8
+    },
+    "1060": {
+      "games": 100,
+      "wins": 92.0,
+      "win_rate": 0.92,
+      "avg_steps": 196.69,
+      "seconds": 811.3268449306488,
+      "workers": 8
+    }
+  },
+  "average_win_rate": 0.96,
+  "win_rate_1020": 1.0,
+  "win_rate_1060": 0.92
+}

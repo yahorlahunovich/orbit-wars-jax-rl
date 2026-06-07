@@ -1,0 +1,31 @@
+seed: 42
+run_name: orbit_wars_ppo_smoke
+device: auto
+save_dir: checkpoints
+checkpoint_every: 1
+log_every: 1
+opponent: self
+
+env:
+  candidate_count: 8
+  ship_bucket_count: 8
+  episode_steps: 10
+  ship_speed: 6.0
+
+model:
+  hidden_size: 32
+  num_heads: 2
+  num_layers: 2
+
+ppo:
+  rollout_steps: 8
+  num_envs: 2
+  total_updates: 2
+  epochs: 1
+  num_minibatches: 2
+  gamma: 0.99
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 0.0003
+  max_grad_norm: 0.5
