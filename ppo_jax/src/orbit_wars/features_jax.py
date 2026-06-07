@@ -322,24 +322,22 @@ def compute_edge_valid_mask_jax(
         )
         path_blocked = blocks_sun | jnp.any(blocks_planet, axis=-1)
         
-        def check_target(tgt):
-            tgt_active = state.active_mask[tgt]
-            is_self = src == tgt
-            not_self = ~is_self
-            
-            base_valid = src_valid & tgt_active & not_self & (~path_blocked[tgt])
-            
-            opts = ship_options_for_edge_jax(src_ships, tgt_ships=state.future_timeline[tgt, cur_turn, 1], tgt_owner=state.future_timeline[tgt, cur_turn, 0], player_id=player_id)
-            
-            def check_opt(opt):
-                ships = opts[opt]
-                ships_valid = (ships >= MIN_LAUNCH_SHIPS) & (ships <= src_ships)
-                noop_valid = src_valid & is_self & (opt == 0)
-                return noop_valid | (base_valid & ships_valid)
-            
-            return jax.vmap(check_opt)(jnp.arange(N_SHIP_OPTIONS))
+        # Fully vectorized check for all targets and options
+        tgt_active = state.active_mask
+        is_self = src == ids
+        not_self = ~is_self
+        base_valid = src_valid & tgt_active & not_self & (~path_blocked)
         
-        return jax.vmap(check_target)(jnp.arange(60))
+        pct_50 = jnp.maximum(1.0, jnp.round(0.50 * src_ships))
+        pct_75 = jnp.maximum(1.0, jnp.round(0.75 * src_ships))
+        pct_100 = src_ships
+        opts = jnp.stack([pct_50, pct_75, pct_100], axis=-1)
+        
+        ships_valid = (opts >= MIN_LAUNCH_SHIPS) & (opts <= src_ships)
+        noop_valid = src_valid & is_self[:, None] & (jnp.arange(N_SHIP_OPTIONS)[None, :] == 0)
+        launch_valid = base_valid[:, None] & ships_valid[None, :]
+        
+        return noop_valid | launch_valid
     
     mask = jax.vmap(check_slot)(jnp.arange(60))  # (60, 60, N_SHIP_OPTIONS)
     return mask
